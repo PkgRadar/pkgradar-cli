@@ -1,0 +1,29 @@
+[package]
+name = "pkgradar"
+version = "0.1.0"
+edition = "2021"
+description = "PkgRadar CI gate and static package scanner"
+license = "Apache-2.0"
+repository = "https://github.com/Zenofex/Rusty_Package_Scanner"
+homepage = "https://pkgradar.com"
+readme = "README.md"
+authors = ["Zenofex <zenofex@zenofex.com>"]
+keywords = ["security", "npm", "supply-chain", "ci"]
+categories = ["command-line-utilities", "development-tools"]
+
+[[bin]]
+name = "pkgradar"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0"
+clap = { version = "4.5", features = ["derive", "env", "wrap_help"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-native-roots"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tokio = { version = "1.0", features = ["rt-multi-thread", "macros"] }
+
+[profile.release]
+codegen-units = 1
+lto = "thin"
+strip = true
