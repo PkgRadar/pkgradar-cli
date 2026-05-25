@@ -3,6 +3,8 @@ use clap::Parser;
 
 mod client;
 mod cmd;
+mod config;
+mod lockfile;
 
 #[derive(Parser, Debug)]
 #[command(

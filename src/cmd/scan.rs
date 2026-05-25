@@ -1,27 +1,46 @@
 use anyhow::Result;
 use clap::Args;
 use serde_json::Value;
+use std::path::PathBuf;
 
 use crate::client::Client;
 use crate::cmd::CommonArgs;
+use crate::lockfile;
 
 #[derive(Args, Debug)]
 pub struct ScanArgs {
-    /// One or more npm package specs, e.g. `@scope/name@1.2.3`.
-    #[arg(required = true, num_args = 1..)]
+    /// One or more npm package specs, e.g. `@scope/name@1.2.3`. Optional
+    /// when `--lockfile` is provided.
+    #[arg(num_args = 0..)]
     pub specs: Vec<String>,
+
+    /// Path to a lockfile to scan (npm / pnpm / yarn-classic).
+    #[arg(long)]
+    pub lockfile: Option<PathBuf>,
 
     #[command(flatten)]
     pub common: CommonArgs,
 }
 
 pub async fn run(args: ScanArgs) -> Result<i32> {
+    let mut specs: Vec<String> = args.specs.clone();
+    if let Some(path) = &args.lockfile {
+        let entries = lockfile::parse(path)?;
+        for entry in entries {
+            specs.push(entry.spec());
+        }
+    }
+    if specs.is_empty() {
+        return Err(anyhow::anyhow!(
+            "no specs provided. Pass --lockfile <path> or one or more `name@version` args."
+        ));
+    }
     let client = Client::new(
         args.common.base_url,
         args.common.token,
         args.common.timeout_ms,
     )?;
-    let response = client.scan(&args.specs).await?;
+    let response = client.scan(&specs).await?;
 
     match args.common.format.as_str() {
         "json" => {
