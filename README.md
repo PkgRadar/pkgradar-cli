@@ -22,7 +22,7 @@ Each release tag (`v0.1.0`+) attaches binaries for:
 - `pkgradar-aarch64-apple-darwin.tar.gz`
 
 ```sh
-TAG=$(curl -sSfL https://api.github.com/repos/Zenofex/pkgradar-cli/releases/latest \
+TAG=$(curl -sSfL https://api.github.com/repos/PkgRadar/pkgradar-cli/releases/latest \
   | grep '"tag_name"' | head -1 | sed -E 's/.*"tag_name": "([^"]+)".*/\1/')
 ARCH=$(uname -m); OS=$(uname -s | tr '[:upper:]' '[:lower:]')
 case "$OS-$ARCH" in
@@ -31,7 +31,7 @@ case "$OS-$ARCH" in
   darwin-x86_64)  ASSET="pkgradar-x86_64-apple-darwin.tar.gz" ;;
   darwin-arm64)   ASSET="pkgradar-aarch64-apple-darwin.tar.gz" ;;
 esac
-curl -sSfL "https://github.com/Zenofex/pkgradar-cli/releases/download/${TAG}/${ASSET}" \
+curl -sSfL "https://github.com/PkgRadar/pkgradar-cli/releases/download/${TAG}/${ASSET}" \
   | tar -xz
 sudo install -m 0755 pkgradar /usr/local/bin/
 ```
@@ -45,7 +45,7 @@ cargo install pkgradar --locked
 ### From source
 
 ```sh
-git clone https://github.com/Zenofex/pkgradar-cli
+git clone https://github.com/PkgRadar/pkgradar-cli
 cd pkgradar-cli
 cargo install --path . --locked
 ```
@@ -56,7 +56,7 @@ The composite action lives at the root of this repo, so you can use it
 directly without specifying a subpath:
 
 ```yaml
-- uses: Zenofex/pkgradar-cli@v1
+- uses: PkgRadar/pkgradar-cli@v1
   with:
     token: ${{ secrets.PKGRADAR_TOKEN }}
     fail-on: high
