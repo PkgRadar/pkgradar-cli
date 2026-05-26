@@ -502,13 +502,16 @@ fn parse_toml_package_array(content: &str) -> Result<Vec<LockfileEntry>> {
         let Some(version) = table.get("version").and_then(|v| v.as_str()) else {
             continue;
         };
-        // Skip source = { type = "git" / "directory" / "url" } — those
-        // aren't gated through the PyPI registry.
+        // Skip non-registry sources. Poetry emits `git`, `directory`,
+        // `url` for off-registry packages; `legacy` for private
+        // PyPI-compatible indexes (which we still treat as registry-
+        // shaped). Anything we don't recognize as a registry source is
+        // skipped so a new Poetry source type can't be silently gated
+        // through PyPI by accident.
         if let Some(source) = table.get("source").and_then(|v| v.as_table()) {
-            if let Some(ty) = source.get("type").and_then(|v| v.as_str()) {
-                if !matches!(ty, "legacy" | "primary" | "default") && ty != "registry" {
-                    continue;
-                }
+            let ty = source.get("type").and_then(|v| v.as_str()).unwrap_or("");
+            if !matches!(ty, "" | "legacy") {
+                continue;
             }
         }
         let normalized = normalize_pypi_name(name);
