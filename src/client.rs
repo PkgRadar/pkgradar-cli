@@ -101,9 +101,9 @@ impl Client {
         Ok(body)
     }
 
-    pub async fn scan(&self, specs: &[String]) -> Result<ScanResponse> {
+    pub async fn scan(&self, ecosystem: &str, specs: &[String]) -> Result<ScanResponse> {
         let payload = serde_json::json!({ "specs": specs });
-        let url = format!("{}/scan/npm", self.base_url);
+        let url = format!("{}/scan/{ecosystem}", self.base_url);
         let response = self
             .inner
             .post(&url)
@@ -126,7 +126,7 @@ impl Client {
         let body: ScanResponse = response
             .json()
             .await
-            .context("parsing /scan/npm response")?;
+            .with_context(|| format!("parsing /scan/{ecosystem} response"))?;
         Ok(body)
     }
 }
