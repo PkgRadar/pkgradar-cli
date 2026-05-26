@@ -1,0 +1,42 @@
+name: audit
+
+# Daily cargo-audit against the RustSec advisory DB so we hear about
+# new advisories matching our locked transitives even when nobody's
+# editing the repo. Runs on PRs too so a dep bump can't silently
+# pull in something with a known CVE.
+
+on:
+  schedule:
+    # 13:00 UTC daily — after rustsec/advisory-db's morning sync window.
+    - cron: '0 13 * * *'
+  pull_request:
+    paths:
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.github/workflows/audit.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  cargo-audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin
+            ~/.cargo/advisory-db
+          key: audit-cargo-${{ runner.os }}-v1
+      - name: Install cargo-audit
+        run: |
+          if ! command -v cargo-audit >/dev/null 2>&1; then
+            cargo install cargo-audit --locked
+          fi
+      - name: Run cargo audit
+        id: audit
+        run: cargo audit --color never
