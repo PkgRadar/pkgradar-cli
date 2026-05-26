@@ -10,14 +10,19 @@ use crate::lockfile::{self, Ecosystem};
 
 #[derive(Args, Debug)]
 pub struct ScanArgs {
-    /// One or more package specs (npm `name@version` or PyPI
-    /// `name==version`). Ecosystem is inferred from the version
-    /// separator. Optional when `--lockfile` is provided.
+    /// One or more package specs (npm `name@version`, PyPI
+    /// `name==version`, or RubyGems `name@version`). Ecosystem
+    /// inferred from format unless `--ecosystem` overrides.
     #[arg(num_args = 0..)]
     pub specs: Vec<String>,
 
+    /// Force the ecosystem for positional specs. npm and rubygems
+    /// both use `name@version`, so disambiguate with this flag.
+    #[arg(long, value_parser = ["npm", "pypi", "rubygems"])]
+    pub ecosystem: Option<String>,
+
     /// Path to a lockfile to scan. Auto-detects npm, pnpm, yarn-classic,
-    /// pip, pipenv, poetry, uv, pdm by filename.
+    /// pip, pipenv, poetry, uv, pdm, Gemfile.lock by filename.
     #[arg(long)]
     pub lockfile: Option<PathBuf>,
 
@@ -40,8 +45,18 @@ pub async fn run(args: ScanArgs) -> Result<i32> {
         }
     };
 
+    let cli_ecosystem = args.ecosystem.as_deref().and_then(|e| match e {
+        "npm" => Some(Ecosystem::Npm),
+        "pypi" => Some(Ecosystem::Pypi),
+        "rubygems" => Some(Ecosystem::Rubygems),
+        _ => None,
+    });
     for raw in &args.specs {
-        let (eco, spec) = classify_cli_spec(raw);
+        let (eco, spec) = if let Some(forced) = cli_ecosystem {
+            (forced, raw.trim().to_string())
+        } else {
+            classify_cli_spec(raw)
+        };
         record(eco, spec);
     }
     if let Some(path) = &args.lockfile {

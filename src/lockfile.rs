@@ -23,6 +23,7 @@ use std::path::Path;
 pub enum Ecosystem {
     Npm,
     Pypi,
+    Rubygems,
 }
 
 impl Ecosystem {
@@ -30,6 +31,7 @@ impl Ecosystem {
         match self {
             Self::Npm => "npm",
             Self::Pypi => "pypi",
+            Self::Rubygems => "rubygems",
         }
     }
 }
@@ -43,12 +45,14 @@ pub struct LockfileEntry {
 
 impl LockfileEntry {
     /// Wire format the gate endpoint expects. npm uses `name@version`,
-    /// PyPI uses `name==version` so the spec round-trips back through
-    /// the registry's canonical version-spec syntax.
+    /// PyPI uses `name==version`, RubyGems uses `name@version` (same
+    /// as npm — Gemfile.lock writes `gem-name (1.2.3)` but we
+    /// normalize on the @-separated form server-side).
     pub fn spec(&self) -> String {
         match self.ecosystem {
             Ecosystem::Npm => format!("{}@{}", self.name, self.version),
             Ecosystem::Pypi => format!("{}=={}", self.name, self.version),
+            Ecosystem::Rubygems => format!("{}@{}", self.name, self.version),
         }
     }
 }
@@ -63,6 +67,7 @@ enum LockfileKind {
     PyPoetryLock,
     PyUvLock,
     PyPdmLock,
+    Gemfile,
 }
 
 pub fn parse(path: &Path) -> Result<Vec<LockfileEntry>> {
@@ -78,6 +83,7 @@ pub fn parse(path: &Path) -> Result<Vec<LockfileEntry>> {
         LockfileKind::PyPoetryLock => parse_poetry_lock(&content)?,
         LockfileKind::PyUvLock => parse_uv_lock(&content)?,
         LockfileKind::PyPdmLock => parse_pdm_lock(&content)?,
+        LockfileKind::Gemfile => parse_gemfile_lock(&content)?,
     };
     let mut entries: Vec<LockfileEntry> = entries
         .into_iter()
@@ -104,6 +110,13 @@ pub fn parse(path: &Path) -> Result<Vec<LockfileEntry>> {
                         && !e.version.starts_with("http://")
                         && !e.version.starts_with("https://")
                         && !e.name.contains('/')
+                }
+                Ecosystem::Rubygems => {
+                    // Gemfile.lock entries from non-registry sources
+                    // (GIT, PATH, plugin sources) get filtered upstream
+                    // in parse_gemfile_lock; this filter is a final
+                    // sanity check.
+                    !e.name.contains('/') && !e.name.is_empty()
                 }
             }
         })
@@ -139,10 +152,11 @@ fn detect_kind(path: &Path, content: &str) -> Result<LockfileKind> {
         "poetry.lock" => Ok(LockfileKind::PyPoetryLock),
         "uv.lock" => Ok(LockfileKind::PyUvLock),
         "pdm.lock" => Ok(LockfileKind::PyPdmLock),
+        "gemfile.lock" | "gems.locked" => Ok(LockfileKind::Gemfile),
         _ => Err(anyhow!(
             "unrecognised lockfile name `{name}`. Supported: package-lock.json, \
              npm-shrinkwrap.json, pnpm-lock.yaml, yarn.lock, requirements.txt, \
-             Pipfile.lock, poetry.lock, uv.lock, pdm.lock."
+             Pipfile.lock, poetry.lock, uv.lock, pdm.lock, Gemfile.lock."
         )),
     }
 }
@@ -539,6 +553,81 @@ fn parse_pdm_lock(content: &str) -> Result<Vec<LockfileEntry>> {
     parse_toml_package_array(content)
 }
 
+// --- RubyGems: Gemfile.lock --------------------------------------------
+
+/// Parse Bundler's `Gemfile.lock`. The interesting section is `GEM`,
+/// containing the registry-resolved tree. Each gem appears as
+/// `    name (1.2.3)` indented under `  specs:`. Transitive deps are
+/// indented one level deeper as `      name (~> 1.0)` (no version
+/// pin — those are not gated, we only care about the resolved
+/// versions). GIT, PATH, PLUGIN sections are skipped.
+fn parse_gemfile_lock(content: &str) -> Result<Vec<LockfileEntry>> {
+    let mut entries = Vec::new();
+    let mut in_gem = false;
+    let mut in_specs = false;
+    for line in content.lines() {
+        // Section headers are flush-left.
+        if !line.starts_with(' ') {
+            let header = line.trim();
+            in_gem = header == "GEM";
+            in_specs = false;
+            continue;
+        }
+        if !in_gem {
+            continue;
+        }
+        let trimmed = line.trim_start();
+        // The `  specs:` line marks the start of resolved versions.
+        if trimmed == "specs:" {
+            in_specs = true;
+            continue;
+        }
+        if !in_specs {
+            continue;
+        }
+        // We only care about lines at exactly 4-space indent (top-level
+        // resolved gem), not deeper indents which are transitive-dep
+        // declarations with version constraints rather than pins.
+        let leading = line.len() - trimmed.len();
+        if leading != 4 {
+            continue;
+        }
+        let Some((name, rest)) = trimmed.split_once(' ') else {
+            continue;
+        };
+        let name = name.trim();
+        if name.is_empty() {
+            continue;
+        }
+        let rest = rest.trim();
+        let Some(version) = rest
+            .strip_prefix('(')
+            .and_then(|v| v.strip_suffix(')'))
+            .map(|s| s.trim())
+        else {
+            continue;
+        };
+        // RubyGems versions are dot-separated; skip version constraints
+        // and platform suffixes that aren't plain version strings.
+        if version.contains(' ') || version.starts_with('~') || version.starts_with('>') {
+            continue;
+        }
+        // Skip platform-qualified entries like `nokogiri (1.16.0-x86_64-linux)`
+        // — we lose nothing because the un-suffixed entry is in the
+        // same `specs:` block for portable resolutions, and platform
+        // pins aren't typosquatted in practice.
+        if version.contains('-') {
+            continue;
+        }
+        entries.push(LockfileEntry {
+            ecosystem: Ecosystem::Rubygems,
+            name: name.to_string(),
+            version: version.to_string(),
+        });
+    }
+    Ok(entries)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -666,6 +755,25 @@ version = "7.4.0"
         assert_eq!(normalize_pypi_name("zope.interface"), "zope-interface");
         assert_eq!(normalize_pypi_name("python__dateutil"), "python-dateutil");
         assert_eq!(normalize_pypi_name("a.b_c-d"), "a-b-c-d");
+    }
+
+    #[test]
+    fn gemfile_lock_parses() {
+        let content = "GEM\n  remote: https://rubygems.org/\n  specs:\n    rack (3.1.0)\n    rack-test (2.1.0)\n      rack (>= 1.3)\n    nokogiri (1.16.0)\n    nokogiri (1.16.0-x86_64-linux)\n\nGIT\n  remote: https://github.com/foo/bar.git\n  revision: deadbeef\n  specs:\n    bar (0.1.0)\n\nDEPENDENCIES\n  rack\n  rack-test\n\nBUNDLED WITH\n   2.4.0\n";
+        let entries = parse_gemfile_lock(content).unwrap();
+        let specs: Vec<String> = entries.iter().map(|e| e.spec()).collect();
+        // GEM block, registry-resolved, plain version → kept.
+        assert!(specs.contains(&"rack@3.1.0".to_string()));
+        assert!(specs.contains(&"rack-test@2.1.0".to_string()));
+        assert!(specs.contains(&"nokogiri@1.16.0".to_string()));
+        // platform-suffixed variant → skipped (we have the portable
+        // entry above).
+        assert!(!specs.iter().any(|s| s.contains("x86_64-linux")));
+        // Transitive dep declarations (indented deeper) with version
+        // constraints → skipped (we only gate pinned resolutions).
+        assert!(!specs.iter().any(|s| s.starts_with("rack@>=")));
+        // GIT-sourced gem → skipped (not on registry).
+        assert!(!specs.iter().any(|s| s.starts_with("bar@")));
     }
 
     #[test]

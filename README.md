@@ -168,10 +168,12 @@ Prints the binary version and the resolved API endpoint.
 | `uv.lock`                     | Yes                                                  |
 | `pdm.lock`                    | Yes                                                  |
 
-PyPI scanning is currently being rolled out — until it's live the gate
-fails open for Python specs with a clear notice so you can wire up the
-gate now and tighten the policy when scans land. npm scanning is
-unaffected and continues to block on the configured `fail-on`.
+### RubyGems ecosystem
+
+| Format          | Supported                                                                       |
+|-----------------|---------------------------------------------------------------------------------|
+| `Gemfile.lock`  | Yes (GEM block, registry-resolved pins; GIT/PATH/PLUGIN sources skipped)        |
+| `gems.locked`   | Yes                                                                             |
 
 The parser deduplicates by `(ecosystem, name, version)`, normalizes
 PyPI names per PEP 503, and skips non-registry refs (`file:`, `link:`,

@@ -11,11 +11,19 @@ use crate::config;
 
 #[derive(Args, Debug)]
 pub struct GateArgs {
-    /// One or more package specs, e.g. `lodash@4.17.21` (npm) or
-    /// `requests==2.31.0` (PyPI). Ecosystem is inferred from the
-    /// version separator. Optional when `--lockfile` is provided.
+    /// One or more package specs, e.g. `lodash@4.17.21` (npm),
+    /// `requests==2.31.0` (PyPI), or `rails@8.0.0` (RubyGems with
+    /// --ecosystem rubygems). Ecosystem is inferred from the version
+    /// separator (`==` → PyPI) unless `--ecosystem` overrides.
+    /// Optional when `--lockfile` is provided.
     #[arg(num_args = 0..)]
     pub specs: Vec<String>,
+
+    /// Force the ecosystem for positional specs. npm and rubygems
+    /// both use the `name@version` format so when ambiguous, this
+    /// is how you disambiguate.
+    #[arg(long, value_parser = ["npm", "pypi", "rubygems"])]
+    pub ecosystem: Option<String>,
 
     /// Block when a spec's risk is at or above this level. Overrides the
     /// `fail_on` value in `.pkgradar.yml` if both are present.
@@ -24,7 +32,7 @@ pub struct GateArgs {
 
     /// Path to a lockfile to scan in addition to (or instead of) `<specs>`.
     /// Auto-detects npm / pnpm / yarn-classic / pip / pipenv / poetry /
-    /// uv / pdm by filename.
+    /// uv / pdm / Gemfile.lock by filename.
     #[arg(long)]
     pub lockfile: Option<PathBuf>,
 
@@ -96,9 +104,22 @@ pub async fn run(args: GateArgs) -> Result<i32> {
         }
     };
 
-    // Positional CLI specs + watchlist: ecosystem inferred from format.
+    // Positional CLI specs + watchlist: --ecosystem flag wins; else
+    // classify by version separator format. RubyGems shares the
+    // `name@version` shape with npm so without the flag we'd
+    // ambiguously route to npm by default.
+    let cli_ecosystem = args.ecosystem.as_deref().and_then(|e| match e {
+        "npm" => Some(Ecosystem::Npm),
+        "pypi" => Some(Ecosystem::Pypi),
+        "rubygems" => Some(Ecosystem::Rubygems),
+        _ => None,
+    });
     for raw in args.specs.iter().chain(cfg.watchlist.iter()) {
-        let (eco, spec) = classify_cli_spec(raw);
+        let (eco, spec) = if let Some(forced) = cli_ecosystem {
+            (forced, raw.trim().to_string())
+        } else {
+            classify_cli_spec(raw)
+        };
         record(eco, spec);
     }
     if let Some(path) = &args.lockfile {
