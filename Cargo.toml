@@ -10,6 +10,13 @@ readme = "README.md"
 authors = ["Zenofex <zenofex@zenofex.com>"]
 keywords = ["security", "npm", "supply-chain", "ci"]
 categories = ["command-line-utilities", "development-tools"]
+# Files shipped to crates.io. The GitHub Action manifest and CI/release
+# workflows are only useful when developing in the repo, so they're
+# excluded from the .crate to keep the published artifact lean.
+exclude = [
+    ".github/",
+    "action.yml",
+]
 
 [[bin]]
 name = "pkgradar"
