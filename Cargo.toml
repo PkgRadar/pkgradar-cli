@@ -29,6 +29,9 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 serde_yaml = "0.9"
+# poetry.lock, uv.lock, pdm.lock, pyproject.toml all use TOML. Kept on a
+# minor-only floor since toml 0.8 is the current API surface.
+toml = "0.8"
 tokio = { version = "1.0", features = ["rt-multi-thread", "macros"] }
 
 [profile.release]

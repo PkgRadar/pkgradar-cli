@@ -1,17 +1,19 @@
 use anyhow::Result;
 use clap::Args;
 use serde_json::Value;
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::path::PathBuf;
 
 use crate::client::{BlockedItem, Client, GateResponse};
 use crate::cmd::CommonArgs;
-use crate::{config, lockfile};
+use crate::lockfile::{self, Ecosystem};
+use crate::config;
 
 #[derive(Args, Debug)]
 pub struct GateArgs {
-    /// One or more npm package specs, e.g. `lodash@4.17.21`. Optional when
-    /// `--lockfile` is provided.
+    /// One or more package specs, e.g. `lodash@4.17.21` (npm) or
+    /// `requests==2.31.0` (PyPI). Ecosystem is inferred from the
+    /// version separator. Optional when `--lockfile` is provided.
     #[arg(num_args = 0..)]
     pub specs: Vec<String>,
 
@@ -21,7 +23,8 @@ pub struct GateArgs {
     pub fail_on: Option<String>,
 
     /// Path to a lockfile to scan in addition to (or instead of) `<specs>`.
-    /// Auto-detects npm / pnpm / yarn-classic by filename.
+    /// Auto-detects npm / pnpm / yarn-classic / pip / pipenv / poetry /
+    /// uv / pdm by filename.
     #[arg(long)]
     pub lockfile: Option<PathBuf>,
 
@@ -37,6 +40,12 @@ pub struct GateArgs {
 
     #[command(flatten)]
     pub common: CommonArgs,
+}
+
+/// Bucket of specs that all hit the same `/gate/{ecosystem}` endpoint.
+struct EcosystemBucket {
+    specs: Vec<String>,
+    allowlisted: HashSet<String>,
 }
 
 pub async fn run(args: GateArgs) -> Result<i32> {
@@ -61,30 +70,46 @@ pub async fn run(args: GateArgs) -> Result<i32> {
         cfg.fail_open.unwrap_or(true)
     };
 
-    let mut specs: Vec<String> = args.specs.clone();
-    if let Some(path) = &args.lockfile {
-        let entries = lockfile::parse(path)?;
-        for entry in entries {
-            specs.push(entry.spec());
-        }
-    }
-    for s in &cfg.watchlist {
-        specs.push(s.clone());
-    }
-
     let allow: HashSet<String> = cfg.allowlist.iter().cloned().collect();
-    let mut deduped: Vec<String> = Vec::new();
-    let mut seen: HashSet<String> = HashSet::new();
-    for spec in specs {
-        if allow.contains(&spec) {
-            continue;
+
+    // Collect all candidate (ecosystem, spec) pairs, deduplicate, drop
+    // allowlisted specs, and finally bucket them per ecosystem.
+    let mut seen: HashSet<(Ecosystem, String)> = HashSet::new();
+    let mut buckets: BTreeMap<Ecosystem, EcosystemBucket> = BTreeMap::new();
+
+    let mut record = |eco: Ecosystem, spec: String| {
+        if spec.is_empty() {
+            return;
         }
-        if seen.insert(spec.clone()) {
-            deduped.push(spec);
+        let bucket = buckets
+            .entry(eco)
+            .or_insert_with(|| EcosystemBucket {
+                specs: Vec::new(),
+                allowlisted: HashSet::new(),
+            });
+        if allow.contains(&spec) {
+            bucket.allowlisted.insert(spec);
+            return;
+        }
+        if seen.insert((eco, spec.clone())) {
+            bucket.specs.push(spec);
+        }
+    };
+
+    // Positional CLI specs + watchlist: ecosystem inferred from format.
+    for raw in args.specs.iter().chain(cfg.watchlist.iter()) {
+        let (eco, spec) = classify_cli_spec(raw);
+        record(eco, spec);
+    }
+    if let Some(path) = &args.lockfile {
+        for entry in lockfile::parse(path)? {
+            record(eco_from_lockfile(entry.ecosystem), entry.spec());
         }
     }
 
-    if deduped.is_empty() {
+    let total_specs: usize = buckets.values().map(|b| b.specs.len()).sum();
+    let total_allowlisted: usize = buckets.values().map(|b| b.allowlisted.len()).sum();
+    if total_specs == 0 {
         if !args.common.quiet {
             eprintln!(
                 "pkgradar: nothing to gate (no specs provided and lockfile/allowlist filtered everything)."
@@ -94,27 +119,88 @@ pub async fn run(args: GateArgs) -> Result<i32> {
     }
 
     let client = Client::new(args.common.base_url, args.common.token, timeout_ms)?;
-    let response = match client.gate(&deduped, &fail_on).await {
-        Ok(r) => r,
-        Err(err) => {
-            if fail_open {
-                eprintln!(
-                    "pkgradar: gate API call failed ({err:#}); fail-open enabled, exiting 0. \
-                     Set `fail_open: false` in .pkgradar.yml or pass --no-fail-open to harden."
-                );
-                return Ok(0);
-            } else {
-                return Err(err);
-            }
+    let mut combined_allowed = true;
+    let mut combined_blocked: Vec<BlockedItem> = Vec::new();
+    let mut combined_reports: Vec<Value> = Vec::new();
+    let mut last_fail_on = fail_on.clone();
+
+    for (ecosystem, bucket) in &buckets {
+        if bucket.specs.is_empty() {
+            continue;
         }
+        let response = match client
+            .gate(ecosystem.as_str(), &bucket.specs, &fail_on)
+            .await
+        {
+            Ok(r) => r,
+            Err(err) => {
+                if fail_open {
+                    eprintln!(
+                        "pkgradar: gate API call for {} failed ({err:#}); fail-open enabled, exiting 0. \
+                         Set `fail_open: false` in .pkgradar.yml or pass --no-fail-open to harden.",
+                        ecosystem.as_str()
+                    );
+                    return Ok(0);
+                } else {
+                    return Err(err);
+                }
+            }
+        };
+        if !response.allowed {
+            combined_allowed = false;
+        }
+        last_fail_on = response.fail_on.clone();
+        // Tag each report with its ecosystem if the server didn't (for
+        // older API versions that didn't echo the field back).
+        for mut r in response.reports {
+            if r.get("ecosystem").is_none() {
+                if let Some(obj) = r.as_object_mut() {
+                    obj.insert(
+                        "ecosystem".to_string(),
+                        Value::String(ecosystem.as_str().to_string()),
+                    );
+                }
+            }
+            combined_reports.push(r);
+        }
+        combined_blocked.extend(response.blocked);
+    }
+
+    let merged = GateResponse {
+        allowed: combined_allowed,
+        fail_on: last_fail_on,
+        blocked: combined_blocked,
+        reports: combined_reports,
     };
 
     match args.common.format.as_str() {
-        "json" => println!("{}", serde_json::to_string_pretty(&render_json(&response))?),
-        _ => render_text(&response, args.common.quiet, allow.len()),
+        "json" => println!(
+            "{}",
+            serde_json::to_string_pretty(&render_json(&merged))?
+        ),
+        _ => render_text(&merged, args.common.quiet, total_allowlisted),
     }
 
-    Ok(if response.allowed { 0 } else { 1 })
+    Ok(if merged.allowed { 0 } else { 1 })
+}
+
+/// Maps lockfile ecosystem enum to the CLI's local enum. (They share a
+/// shape but live in different modules so the renderer can stay
+/// agnostic.)
+fn eco_from_lockfile(eco: Ecosystem) -> Ecosystem {
+    eco
+}
+
+/// Classify a bare CLI spec by its version separator: `==` → PyPI,
+/// otherwise npm-style `@`. Conservative — anything ambiguous falls back
+/// to npm so existing v0.1.0 invocations keep working.
+fn classify_cli_spec(raw: &str) -> (Ecosystem, String) {
+    let trimmed = raw.trim().to_string();
+    if trimmed.contains("==") {
+        (Ecosystem::Pypi, trimmed)
+    } else {
+        (Ecosystem::Npm, trimmed)
+    }
 }
 
 fn render_json(response: &GateResponse) -> Value {
@@ -138,6 +224,7 @@ fn blocked_to_json(b: &BlockedItem) -> Value {
 fn report_to_decision(report: &Value) -> Value {
     serde_json::json!({
         "target": report.get("target").and_then(Value::as_str),
+        "ecosystem": report.get("ecosystem").and_then(Value::as_str),
         "risk": report.get("risk").and_then(Value::as_str),
         "score": report.get("score").and_then(Value::as_u64),
     })
@@ -156,11 +243,17 @@ fn render_text(response: &GateResponse, quiet: bool, allowlisted: usize) {
             .and_then(Value::as_str)
             .unwrap_or("unknown");
         let score = report.get("score").and_then(Value::as_u64).unwrap_or(0);
+        let ecosystem = report
+            .get("ecosystem")
+            .and_then(Value::as_str)
+            .unwrap_or("npm");
         let is_blocked = blocked_specs.contains(target);
         let mark = if is_blocked { "BLOCK" } else { "PASS " };
 
         if is_blocked || !quiet {
-            println!("{mark} {target:<48} risk={risk:<6} score={score}");
+            println!(
+                "{mark} [{ecosystem:<4}] {target:<48} risk={risk:<7} score={score}"
+            );
         }
     }
 

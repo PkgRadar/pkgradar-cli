@@ -1,30 +1,55 @@
-//! Parse npm / pnpm / yarn lockfiles into a flat (name, version) list that
-//! we can hand to the gate endpoint.
+//! Parse lockfiles into a flat (ecosystem, name, version) list that the
+//! gate endpoint can consume.
 //!
 //! Supported formats:
-//!   - `package-lock.json` v1, v2, v3 (and `npm-shrinkwrap.json`)
-//!   - `pnpm-lock.yaml` (pnpm v6+)
-//!   - `yarn.lock` v1 (Yarn Classic)
+//!   - npm: `package-lock.json` v1/v2/v3, `npm-shrinkwrap.json`
+//!   - pnpm: `pnpm-lock.yaml` (v6+)
+//!   - yarn classic: `yarn.lock` v1
+//!   - PyPI: `requirements.txt`, `requirements.lock`, `Pipfile.lock`,
+//!     `poetry.lock`, `uv.lock`, `pdm.lock`
 //!
 //! Not supported (errors with a clear message):
 //!   - Yarn Berry (`yarn.lock` v2+, recognised by the `__metadata:` header).
 //!
 //! The parser is intentionally permissive: unknown fields are ignored,
 //! malformed entries are skipped, and the output is deduplicated by
-//! (name, version). Better to under-flag than to refuse a real lockfile.
+//! (ecosystem, name, version). Better to under-flag than to refuse a
+//! real lockfile.
 
 use anyhow::{anyhow, Context, Result};
 use std::path::Path;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Ecosystem {
+    Npm,
+    Pypi,
+}
+
+impl Ecosystem {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Npm => "npm",
+            Self::Pypi => "pypi",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct LockfileEntry {
+    pub ecosystem: Ecosystem,
     pub name: String,
     pub version: String,
 }
 
 impl LockfileEntry {
+    /// Wire format the gate endpoint expects. npm uses `name@version`,
+    /// PyPI uses `name==version` so the spec round-trips back through
+    /// the registry's canonical version-spec syntax.
     pub fn spec(&self) -> String {
-        format!("{}@{}", self.name, self.version)
+        match self.ecosystem {
+            Ecosystem::Npm => format!("{}@{}", self.name, self.version),
+            Ecosystem::Pypi => format!("{}=={}", self.name, self.version),
+        }
     }
 }
 
@@ -33,6 +58,11 @@ enum LockfileKind {
     Npm,
     Pnpm,
     YarnV1,
+    PyRequirements,
+    PyPipfileLock,
+    PyPoetryLock,
+    PyUvLock,
+    PyPdmLock,
 }
 
 pub fn parse(path: &Path) -> Result<Vec<LockfileEntry>> {
@@ -43,19 +73,39 @@ pub fn parse(path: &Path) -> Result<Vec<LockfileEntry>> {
         LockfileKind::Npm => parse_npm(&content)?,
         LockfileKind::Pnpm => parse_pnpm(&content)?,
         LockfileKind::YarnV1 => parse_yarn_v1(&content)?,
+        LockfileKind::PyRequirements => parse_requirements_txt(&content)?,
+        LockfileKind::PyPipfileLock => parse_pipfile_lock(&content)?,
+        LockfileKind::PyPoetryLock => parse_poetry_lock(&content)?,
+        LockfileKind::PyUvLock => parse_uv_lock(&content)?,
+        LockfileKind::PyPdmLock => parse_pdm_lock(&content)?,
     };
     let mut entries: Vec<LockfileEntry> = entries
         .into_iter()
         .filter(|e| !e.name.is_empty() && !e.version.is_empty())
-        // Skip non-registry refs we can't gate against npm registry (file:, link:, workspace:, git:, etc.)
         .filter(|e| {
-            !e.version.starts_with("file:")
-                && !e.version.starts_with("link:")
-                && !e.version.starts_with("workspace:")
-                && !e.version.starts_with("git+")
-                && !e.version.starts_with("github:")
-                && !e.version.starts_with("npm:")
-                && !e.version.contains('/')
+            match e.ecosystem {
+                Ecosystem::Npm => {
+                    // Non-registry refs we can't gate against the npm registry.
+                    !e.version.starts_with("file:")
+                        && !e.version.starts_with("link:")
+                        && !e.version.starts_with("workspace:")
+                        && !e.version.starts_with("git+")
+                        && !e.version.starts_with("github:")
+                        && !e.version.starts_with("npm:")
+                        && !e.version.contains('/')
+                }
+                Ecosystem::Pypi => {
+                    // PyPI deps that live outside the public registry: git
+                    // URLs, file://, direct URL refs (PEP 508 url specs),
+                    // editable installs. Gate has nothing to say about
+                    // those.
+                    !e.version.starts_with("git+")
+                        && !e.version.starts_with("file:")
+                        && !e.version.starts_with("http://")
+                        && !e.version.starts_with("https://")
+                        && !e.name.contains('/')
+                }
+            }
         })
         .collect();
     entries.sort();
@@ -82,9 +132,17 @@ fn detect_kind(path: &Path, content: &str) -> Result<LockfileKind> {
             }
             Ok(LockfileKind::YarnV1)
         }
+        "requirements.txt" | "requirements.lock" | "constraints.txt" => {
+            Ok(LockfileKind::PyRequirements)
+        }
+        "pipfile.lock" => Ok(LockfileKind::PyPipfileLock),
+        "poetry.lock" => Ok(LockfileKind::PyPoetryLock),
+        "uv.lock" => Ok(LockfileKind::PyUvLock),
+        "pdm.lock" => Ok(LockfileKind::PyPdmLock),
         _ => Err(anyhow!(
-            "unrecognised lockfile name `{name}`. Expected package-lock.json, \
-             npm-shrinkwrap.json, pnpm-lock.yaml, or yarn.lock."
+            "unrecognised lockfile name `{name}`. Supported: package-lock.json, \
+             npm-shrinkwrap.json, pnpm-lock.yaml, yarn.lock, requirements.txt, \
+             Pipfile.lock, poetry.lock, uv.lock, pdm.lock."
         )),
     }
 }
@@ -116,6 +174,7 @@ fn parse_npm(content: &str) -> Result<Vec<LockfileEntry>> {
                 }
                 if let Some(ver) = value.get("version").and_then(|v| v.as_str()) {
                     entries.push(LockfileEntry {
+                        ecosystem: Ecosystem::Npm,
                         name,
                         version: ver.to_string(),
                     });
@@ -132,6 +191,7 @@ fn walk_npm_v1(deps: &serde_json::Map<String, serde_json::Value>, out: &mut Vec<
     for (name, value) in deps {
         if let Some(version) = value.get("version").and_then(|v| v.as_str()) {
             out.push(LockfileEntry {
+                ecosystem: Ecosystem::Npm,
                 name: name.clone(),
                 version: version.to_string(),
             });
@@ -159,7 +219,11 @@ fn parse_pnpm(content: &str) -> Result<Vec<LockfileEntry>> {
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string())
                 .unwrap_or(version_from_key);
-            entries.push(LockfileEntry { name, version });
+            entries.push(LockfileEntry {
+                ecosystem: Ecosystem::Npm,
+                name,
+                version,
+            });
         }
     }
     Ok(entries)
@@ -214,6 +278,7 @@ fn parse_yarn_v1(content: &str) -> Result<Vec<LockfileEntry>> {
         if let Some(v) = version.take() {
             for n in names.drain(..) {
                 entries.push(LockfileEntry {
+                    ecosystem: Ecosystem::Npm,
                     name: n,
                     version: v.clone(),
                 });
@@ -259,6 +324,216 @@ fn parse_yarn_name(token: &str) -> Option<String> {
         let at = token.find('@')?;
         Some(token[..at].to_string())
     }
+}
+
+// --- PyPI: requirements.txt ----------------------------------------------
+
+/// Parse pip-style requirements. Only fully pinned lines (`name==X.Y.Z`)
+/// are kept — the gate needs concrete versions, not ranges. Comments,
+/// blank lines, `-r/-c/-e` directives, environment markers, hashes,
+/// and unpinned specs are skipped.
+fn parse_requirements_txt(content: &str) -> Result<Vec<LockfileEntry>> {
+    let mut entries = Vec::new();
+    // Support line continuation with trailing backslash.
+    let mut joined = String::new();
+    for raw in content.lines() {
+        if raw.trim_end().ends_with('\\') {
+            let without_backslash = raw.trim_end().trim_end_matches('\\');
+            joined.push_str(without_backslash);
+            joined.push(' ');
+        } else {
+            joined.push_str(raw);
+            joined.push('\n');
+        }
+    }
+    for line in joined.lines() {
+        let line = match line.split_once('#') {
+            Some((before, _)) => before,
+            None => line,
+        };
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        // Skip pip directives (`-r requirements-dev.txt`, `--hash=...`,
+        // `--index-url=...`, etc.) and editable installs (`-e <vcs>`).
+        if line.starts_with('-') {
+            continue;
+        }
+        if let Some(entry) = parse_requirements_line(line) {
+            entries.push(entry);
+        }
+    }
+    Ok(entries)
+}
+
+/// Returns Some for `name[extras]==version` lines, None for everything
+/// else (`>=`, `~=`, ranges, URL specs, markers without ==, etc.).
+fn parse_requirements_line(line: &str) -> Option<LockfileEntry> {
+    // Strip environment markers: `name==1.0.0 ; python_version >= "3.10"`.
+    let line = match line.split_once(';') {
+        Some((before, _)) => before.trim(),
+        None => line.trim(),
+    };
+    // Strip hash fragments: `name==1.0.0 --hash=sha256:abc`.
+    let line = match line.split_once("--hash") {
+        Some((before, _)) => before.trim(),
+        None => line,
+    };
+    // Find the operator. We require `==` (or `===` for PEP 440 arbitrary
+    // equality) so we know we have a pinned version.
+    let (op_idx, op_len) = if let Some(idx) = line.find("===") {
+        (idx, 3)
+    } else if let Some(idx) = line.find("==") {
+        (idx, 2)
+    } else {
+        return None;
+    };
+    let name_part = line[..op_idx].trim();
+    let version_part = line[op_idx + op_len..].trim();
+    if name_part.is_empty() || version_part.is_empty() {
+        return None;
+    }
+    // Strip `[extras]` suffix: `requests[security]==2.31.0`.
+    let name = match name_part.split_once('[') {
+        Some((before, _)) => before.trim(),
+        None => name_part,
+    };
+    let name = normalize_pypi_name(name);
+    if !is_valid_pypi_name(&name) {
+        return None;
+    }
+    // Bare version, no trailing constraints like `==1.0.0,!=1.1.0`.
+    if version_part.contains(',') || version_part.contains(' ') {
+        return None;
+    }
+    let version = version_part.trim_matches('"').trim_matches('\'').to_string();
+    Some(LockfileEntry {
+        ecosystem: Ecosystem::Pypi,
+        name,
+        version,
+    })
+}
+
+/// PEP 503 name normalization: lowercase, runs of `_`/`.`/`-` collapse
+/// to a single `-`. Two distributions whose normalized names match are
+/// considered the same package by PyPI.
+fn normalize_pypi_name(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let mut prev_sep = false;
+    for c in raw.chars() {
+        if matches!(c, '_' | '.' | '-') {
+            if !prev_sep && !out.is_empty() {
+                out.push('-');
+            }
+            prev_sep = true;
+        } else {
+            out.push(c.to_ascii_lowercase());
+            prev_sep = false;
+        }
+    }
+    while out.ends_with('-') {
+        out.pop();
+    }
+    out
+}
+
+fn is_valid_pypi_name(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+}
+
+// --- PyPI: Pipfile.lock --------------------------------------------------
+
+fn parse_pipfile_lock(content: &str) -> Result<Vec<LockfileEntry>> {
+    let parsed: serde_json::Value =
+        serde_json::from_str(content).context("parsing Pipfile.lock")?;
+    let mut entries = Vec::new();
+    for section in ["default", "develop"] {
+        if let Some(obj) = parsed.get(section).and_then(|v| v.as_object()) {
+            for (name, value) in obj {
+                let Some(raw) = value.get("version").and_then(|v| v.as_str()) else {
+                    continue;
+                };
+                let version = raw
+                    .trim()
+                    .trim_start_matches("==")
+                    .trim_start_matches("===")
+                    .trim()
+                    .to_string();
+                if version.is_empty() {
+                    continue;
+                }
+                let normalized = normalize_pypi_name(name);
+                if !is_valid_pypi_name(&normalized) {
+                    continue;
+                }
+                entries.push(LockfileEntry {
+                    ecosystem: Ecosystem::Pypi,
+                    name: normalized,
+                    version,
+                });
+            }
+        }
+    }
+    Ok(entries)
+}
+
+// --- PyPI: poetry.lock ---------------------------------------------------
+
+/// Common shape: `[[package]] name = "foo"\nversion = "1.2.3"` blocks.
+/// This shape is shared by poetry.lock, uv.lock, and pdm.lock — they
+/// all use the TOML `[[package]]` array convention.
+fn parse_toml_package_array(content: &str) -> Result<Vec<LockfileEntry>> {
+    let parsed: toml::Value = toml::from_str(content).context("parsing TOML lockfile")?;
+    let mut entries = Vec::new();
+    let Some(packages) = parsed.get("package").and_then(|v| v.as_array()) else {
+        return Ok(entries);
+    };
+    for pkg in packages {
+        let Some(table) = pkg.as_table() else {
+            continue;
+        };
+        let Some(name) = table.get("name").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let Some(version) = table.get("version").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        // Skip source = { type = "git" / "directory" / "url" } — those
+        // aren't gated through the PyPI registry.
+        if let Some(source) = table.get("source").and_then(|v| v.as_table()) {
+            if let Some(ty) = source.get("type").and_then(|v| v.as_str()) {
+                if !matches!(ty, "legacy" | "primary" | "default") && ty != "registry" {
+                    continue;
+                }
+            }
+        }
+        let normalized = normalize_pypi_name(name);
+        if !is_valid_pypi_name(&normalized) {
+            continue;
+        }
+        entries.push(LockfileEntry {
+            ecosystem: Ecosystem::Pypi,
+            name: normalized,
+            version: version.to_string(),
+        });
+    }
+    Ok(entries)
+}
+
+fn parse_poetry_lock(content: &str) -> Result<Vec<LockfileEntry>> {
+    parse_toml_package_array(content)
+}
+
+fn parse_uv_lock(content: &str) -> Result<Vec<LockfileEntry>> {
+    parse_toml_package_array(content)
+}
+
+fn parse_pdm_lock(content: &str) -> Result<Vec<LockfileEntry>> {
+    parse_toml_package_array(content)
 }
 
 #[cfg(test)]
@@ -323,22 +598,92 @@ packages:
     }
 
     #[test]
+    fn requirements_txt_pinned_only() {
+        let content = "\
+# bound
+requests==2.31.0
+urllib3==2.0.7 ; python_version >= \"3.10\"
+flask[async]==3.0.0
+unpinned-package>=1.0.0
+ranged==1.0.0,!=1.1.0
+-r requirements-dev.txt
+--hash=sha256:abc
+git+https://github.com/x/y.git@v1
+torch===2.5.0
+";
+        let entries = parse_requirements_txt(content).unwrap();
+        let specs: Vec<String> = entries.iter().map(|e| e.spec()).collect();
+        assert!(specs.contains(&"requests==2.31.0".to_string()));
+        assert!(specs.contains(&"urllib3==2.0.7".to_string()));
+        assert!(specs.contains(&"flask==3.0.0".to_string()));
+        assert!(specs.contains(&"torch==2.5.0".to_string()));
+        assert!(!specs.iter().any(|s| s.starts_with("unpinned-package")));
+        assert!(!specs.iter().any(|s| s.starts_with("ranged")));
+    }
+
+    #[test]
+    fn pipfile_lock_parses() {
+        let content = r#"{
+            "default": {
+                "requests": { "version": "==2.31.0" },
+                "Flask": { "version": "==3.0.0" }
+            },
+            "develop": {
+                "pytest": { "version": "==7.4.0" }
+            }
+        }"#;
+        let entries = parse_pipfile_lock(content).unwrap();
+        let specs: Vec<String> = entries.iter().map(|e| e.spec()).collect();
+        assert!(specs.contains(&"requests==2.31.0".to_string()));
+        assert!(specs.contains(&"flask==3.0.0".to_string()));
+        assert!(specs.contains(&"pytest==7.4.0".to_string()));
+    }
+
+    #[test]
+    fn poetry_lock_parses() {
+        let content = r#"
+[[package]]
+name = "requests"
+version = "2.31.0"
+description = ""
+
+[[package]]
+name = "Pytest"
+version = "7.4.0"
+"#;
+        let entries = parse_poetry_lock(content).unwrap();
+        let specs: Vec<String> = entries.iter().map(|e| e.spec()).collect();
+        assert!(specs.contains(&"requests==2.31.0".to_string()));
+        assert!(specs.contains(&"pytest==7.4.0".to_string()));
+    }
+
+    #[test]
+    fn pypi_name_normalization() {
+        assert_eq!(normalize_pypi_name("Requests"), "requests");
+        assert_eq!(normalize_pypi_name("zope.interface"), "zope-interface");
+        assert_eq!(normalize_pypi_name("python__dateutil"), "python-dateutil");
+        assert_eq!(normalize_pypi_name("a.b_c-d"), "a-b-c-d");
+    }
+
+    #[test]
     fn parse_filters_workspace_and_link_versions() {
         let entries = vec![
             LockfileEntry {
+                ecosystem: Ecosystem::Npm,
                 name: "real".to_string(),
                 version: "1.0.0".to_string(),
             },
             LockfileEntry {
+                ecosystem: Ecosystem::Npm,
                 name: "linked".to_string(),
                 version: "link:../foo".to_string(),
             },
             LockfileEntry {
+                ecosystem: Ecosystem::Npm,
                 name: "ws".to_string(),
                 version: "workspace:*".to_string(),
             },
         ];
-        // Simulate the filter the public parse() applies.
         let kept: Vec<_> = entries
             .into_iter()
             .filter(|e| {

@@ -63,15 +63,15 @@ directly without specifying a subpath:
     # lockfile: pnpm-lock.yaml   # optional override; auto-detects otherwise
 ```
 
-| Input       | Required | Default | Meaning                                                                                  |
-|-------------|----------|---------|------------------------------------------------------------------------------------------|
-| `token`     | yes      | —       | API token from <https://pkgradar.com/dashboard/keys>                                     |
-| `lockfile`  | no       | auto    | Path to `package-lock.json` / `pnpm-lock.yaml` / `yarn.lock`. Auto-detects when omitted. |
-| `fail-on`   | no       | `high`  | Block on this risk level or worse (`low`, `review`, `high`)                              |
-| `config`    | no       | —       | Path to a `.pkgradar.yml` config file                                                    |
-| `fail-open` | no       | `true`  | Exit 0 on transport-level API errors (timeout, 5xx). Set `false` to harden.              |
-| `version`   | no       | latest  | Pin a specific `pkgradar` CLI version, e.g. `v0.1.0`                                     |
-| `base-url`  | no       | —       | Override `https://pkgradar.com` (self-hosted only)                                       |
+| Input       | Required | Default | Meaning                                                                                                       |
+|-------------|----------|---------|---------------------------------------------------------------------------------------------------------------|
+| `token`     | yes      | —       | API token from <https://pkgradar.com/dashboard/keys>                                                          |
+| `lockfile`  | no       | auto    | Path to a lockfile. Auto-detects npm/pnpm/yarn-classic, pip/pipenv/poetry/uv/pdm in the working dir.          |
+| `fail-on`   | no       | `high`  | Block on this risk level or worse (`low`, `review`, `high`)                                                   |
+| `config`    | no       | —       | Path to a `.pkgradar.yml` config file                                                                         |
+| `fail-open` | no       | `true`  | Exit 0 on transport-level API errors (timeout, 5xx). Set `false` to harden.                                   |
+| `version`   | no       | latest  | Pin a specific `pkgradar` CLI version, e.g. `v0.1.0`                                                          |
+| `base-url`  | no       | —       | Override `https://pkgradar.com` (self-hosted only)                                                            |
 
 The action prefers a prebuilt binary from this repo's releases for fast
 cold-start (~10s) and falls back to `cargo install` when the runner platform
@@ -144,18 +144,38 @@ Prints the binary version and the resolved API endpoint.
 
 ## Lockfile support
 
-| Format                 | Supported              |
-|------------------------|------------------------|
-| `package-lock.json` v1 | Yes                    |
-| `package-lock.json` v2 | Yes                    |
-| `package-lock.json` v3 | Yes                    |
-| `npm-shrinkwrap.json`  | Yes                    |
-| `pnpm-lock.yaml` v6+   | Yes                    |
-| `yarn.lock` v1         | Yes                    |
-| `yarn.lock` v2+ (Berry)| No — errors with a hint |
+### npm ecosystem
 
-The parser deduplicates by `(name, version)` and skips non-registry refs
-(`file:`, `link:`, `workspace:`, `git+`, `github:`).
+| Format                  | Supported               |
+|-------------------------|-------------------------|
+| `package-lock.json` v1  | Yes                     |
+| `package-lock.json` v2  | Yes                     |
+| `package-lock.json` v3  | Yes                     |
+| `npm-shrinkwrap.json`   | Yes                     |
+| `pnpm-lock.yaml` v6+    | Yes                     |
+| `yarn.lock` v1          | Yes                     |
+| `yarn.lock` v2+ (Berry) | No — errors with a hint |
+
+### PyPI ecosystem
+
+| Format                        | Supported                                            |
+|-------------------------------|------------------------------------------------------|
+| `requirements.txt`            | Yes — only fully-pinned (`==`) entries are gated     |
+| `requirements.lock` (pip-tools) | Yes                                                |
+| `constraints.txt`             | Yes                                                  |
+| `Pipfile.lock`                | Yes (default + develop sections)                     |
+| `poetry.lock`                 | Yes                                                  |
+| `uv.lock`                     | Yes                                                  |
+| `pdm.lock`                    | Yes                                                  |
+
+PyPI scanning is currently being rolled out — until it's live the gate
+fails open for Python specs with a clear notice so you can wire up the
+gate now and tighten the policy when scans land. npm scanning is
+unaffected and continues to block on the configured `fail-on`.
+
+The parser deduplicates by `(ecosystem, name, version)`, normalizes
+PyPI names per PEP 503, and skips non-registry refs (`file:`, `link:`,
+`workspace:`, `git+`, `github:`, direct URL specs).
 
 ## Fail-open behaviour
 

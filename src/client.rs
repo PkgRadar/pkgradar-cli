@@ -58,12 +58,22 @@ impl Client {
         })
     }
 
-    pub async fn gate(&self, specs: &[String], fail_on: &str) -> Result<GateResponse> {
+    pub async fn gate(
+        &self,
+        ecosystem: &str,
+        specs: &[String],
+        fail_on: &str,
+    ) -> Result<GateResponse> {
         let payload = serde_json::json!({
             "specs": specs,
             "fail_on": fail_on,
+            "ecosystem": ecosystem,
         });
-        let url = format!("{}/gate/npm", self.base_url);
+        // Path includes the ecosystem so server logs + access logs are
+        // legible without parsing the body. The body's `ecosystem`
+        // field is the canonical source on the server side; the path
+        // is informational.
+        let url = format!("{}/gate/{ecosystem}", self.base_url);
         let response = self
             .inner
             .post(&url)
@@ -87,7 +97,7 @@ impl Client {
         let body: GateResponse = response
             .json()
             .await
-            .context("parsing /gate/npm response")?;
+            .with_context(|| format!("parsing /gate/{ecosystem} response"))?;
         Ok(body)
     }
 

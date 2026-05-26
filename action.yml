@@ -1,8 +1,9 @@
 name: PkgRadar Gate
 description: >-
-  Block CI when an npm dependency upgrade matches PkgRadar's static evidence
-  thresholds. Auto-detects package-lock.json, pnpm-lock.yaml, or yarn.lock
-  in the repo root.
+  Block CI when an npm or PyPI dependency upgrade matches PkgRadar's static
+  evidence thresholds. Auto-detects package-lock.json, pnpm-lock.yaml,
+  yarn.lock, requirements.txt, Pipfile.lock, poetry.lock, uv.lock, or
+  pdm.lock in the working dir.
 author: PkgRadar
 branding:
   icon: shield
@@ -15,7 +16,8 @@ inputs:
   lockfile:
     description: >-
       Path to a lockfile. Auto-detects package-lock.json, pnpm-lock.yaml,
-      yarn.lock in the working dir when unset.
+      yarn.lock, requirements.txt, Pipfile.lock, poetry.lock, uv.lock,
+      or pdm.lock in the working dir when unset.
     required: false
   fail-on:
     description: Block when a spec's risk is at or above this level (low | review | high).
@@ -58,7 +60,13 @@ runs:
         set -euo pipefail
         LOCK="$INPUT_LOCKFILE"
         if [ -z "$LOCK" ]; then
-          for candidate in package-lock.json npm-shrinkwrap.json pnpm-lock.yaml yarn.lock; do
+          # Order: explicit-pin formats first (uv.lock, poetry.lock,
+          # Pipfile.lock all carry exact pins) so a repo using both
+          # requirements.txt + poetry.lock picks the canonical one.
+          for candidate in \
+              package-lock.json npm-shrinkwrap.json pnpm-lock.yaml yarn.lock \
+              uv.lock pdm.lock poetry.lock Pipfile.lock \
+              requirements.lock requirements.txt; do
             if [ -f "$candidate" ]; then
               LOCK="$candidate"
               break
@@ -66,7 +74,7 @@ runs:
           done
         fi
         if [ -z "$LOCK" ] || [ ! -f "$LOCK" ]; then
-          echo '::error::No lockfile found. Pass `lockfile:` explicitly or commit a package-lock.json / pnpm-lock.yaml / yarn.lock.'
+          echo '::error::No lockfile found. Pass `lockfile:` explicitly or commit a supported lockfile (package-lock.json, pnpm-lock.yaml, yarn.lock, requirements.txt, Pipfile.lock, poetry.lock, uv.lock, or pdm.lock).'
           exit 2
         fi
         echo "lockfile=$LOCK" >> "$GITHUB_OUTPUT"
