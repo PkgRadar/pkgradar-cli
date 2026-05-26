@@ -39,8 +39,17 @@ jobs:
           TAG: ${{ github.ref_name }}
         run: |
           set -euo pipefail
-          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            echo "Release $TAG already exists; matrix jobs will attach assets."
+          # Deleting a tag (e.g. when a release is re-cut) auto-converts
+          # any associated GitHub Release into a draft. Without this
+          # branch a re-tag would leave the release silently unpublished
+          # while matrix jobs happily upload to it — exactly the failure
+          # mode we hit on the first v0.1.0 cut.
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json isDraft \
+              --jq '.isDraft' 2>/dev/null | grep -qx true; then
+            echo "Release $TAG exists as a draft; publishing."
+            gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --draft=false
+          elif gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Release $TAG already published; matrix jobs will attach assets."
           else
             gh release create "$TAG" --repo "$GITHUB_REPOSITORY" \
               --title "$TAG" \
