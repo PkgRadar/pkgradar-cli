@@ -128,10 +128,7 @@ fn parse_npm(content: &str) -> Result<Vec<LockfileEntry>> {
     Ok(entries)
 }
 
-fn walk_npm_v1(
-    deps: &serde_json::Map<String, serde_json::Value>,
-    out: &mut Vec<LockfileEntry>,
-) {
+fn walk_npm_v1(deps: &serde_json::Map<String, serde_json::Value>, out: &mut Vec<LockfileEntry>) {
     for (name, value) in deps {
         if let Some(version) = value.get("version").and_then(|v| v.as_str()) {
             out.push(LockfileEntry {
@@ -328,9 +325,18 @@ packages:
     #[test]
     fn parse_filters_workspace_and_link_versions() {
         let entries = vec![
-            LockfileEntry { name: "real".to_string(), version: "1.0.0".to_string() },
-            LockfileEntry { name: "linked".to_string(), version: "link:../foo".to_string() },
-            LockfileEntry { name: "ws".to_string(), version: "workspace:*".to_string() },
+            LockfileEntry {
+                name: "real".to_string(),
+                version: "1.0.0".to_string(),
+            },
+            LockfileEntry {
+                name: "linked".to_string(),
+                version: "link:../foo".to_string(),
+            },
+            LockfileEntry {
+                name: "ws".to_string(),
+                version: "workspace:*".to_string(),
+            },
         ];
         // Simulate the filter the public parse() applies.
         let kept: Vec<_> = entries

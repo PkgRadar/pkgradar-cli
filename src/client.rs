@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{anyhow, Context, Result};
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE};
 use serde::Deserialize;
 use serde_json::Value;
@@ -76,7 +76,9 @@ impl Client {
 
         let status = response.status();
         if status == reqwest::StatusCode::UNAUTHORIZED {
-            return Err(anyhow!("authentication failed (401). Check PKGRADAR_TOKEN."));
+            return Err(anyhow!(
+                "authentication failed (401). Check PKGRADAR_TOKEN."
+            ));
         }
         if !(status.is_success() || status == reqwest::StatusCode::UNPROCESSABLE_ENTITY) {
             let body = response.text().await.unwrap_or_default();
@@ -103,7 +105,9 @@ impl Client {
             .with_context(|| format!("POST {url}"))?;
         let status = response.status();
         if status == reqwest::StatusCode::UNAUTHORIZED {
-            return Err(anyhow!("authentication failed (401). Check PKGRADAR_TOKEN."));
+            return Err(anyhow!(
+                "authentication failed (401). Check PKGRADAR_TOKEN."
+            ));
         }
         if !status.is_success() {
             let body = response.text().await.unwrap_or_default();

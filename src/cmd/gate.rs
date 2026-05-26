@@ -110,10 +110,7 @@ pub async fn run(args: GateArgs) -> Result<i32> {
     };
 
     match args.common.format.as_str() {
-        "json" => println!(
-            "{}",
-            serde_json::to_string_pretty(&render_json(&response))?
-        ),
+        "json" => println!("{}", serde_json::to_string_pretty(&render_json(&response))?),
         _ => render_text(&response, args.common.quiet, allow.len()),
     }
 
@@ -147,8 +144,7 @@ fn report_to_decision(report: &Value) -> Value {
 }
 
 fn render_text(response: &GateResponse, quiet: bool, allowlisted: usize) {
-    let blocked_specs: HashSet<&str> =
-        response.blocked.iter().map(|b| b.target.as_str()).collect();
+    let blocked_specs: HashSet<&str> = response.blocked.iter().map(|b| b.target.as_str()).collect();
 
     for report in &response.reports {
         let target = report
@@ -163,9 +159,7 @@ fn render_text(response: &GateResponse, quiet: bool, allowlisted: usize) {
         let is_blocked = blocked_specs.contains(target);
         let mark = if is_blocked { "BLOCK" } else { "PASS " };
 
-        if is_blocked {
-            println!("{mark} {target:<48} risk={risk:<6} score={score}");
-        } else if !quiet {
+        if is_blocked || !quiet {
             println!("{mark} {target:<48} risk={risk:<6} score={score}");
         }
     }

@@ -70,18 +70,13 @@ fn render_text(reports: &[Value], quiet: bool) {
             .map(|a| a.len())
             .unwrap_or(0);
 
-        println!(
-            "{target}  risk={risk}  score={score}  findings={findings}",
-        );
+        println!("{target}  risk={risk}  score={score}  findings={findings}",);
 
         if !quiet {
             if let Some(arr) = report.get("findings").and_then(Value::as_array) {
                 for finding in arr.iter().take(6) {
                     let kind = finding.get("kind").and_then(Value::as_str).unwrap_or("?");
-                    let detail = finding
-                        .get("detail")
-                        .and_then(Value::as_str)
-                        .unwrap_or("");
+                    let detail = finding.get("detail").and_then(Value::as_str).unwrap_or("");
                     let severity = finding
                         .get("severity")
                         .and_then(Value::as_str)

@@ -55,10 +55,10 @@ pub fn load(path: Option<&Path>) -> Result<RepoConfig> {
     let Some(path) = path else {
         return Ok(RepoConfig::default());
     };
-    let content = std::fs::read_to_string(path)
-        .with_context(|| format!("reading {}", path.display()))?;
-    let cfg: RepoConfig = serde_yaml::from_str(&content)
-        .with_context(|| format!("parsing {}", path.display()))?;
+    let content =
+        std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+    let cfg: RepoConfig =
+        serde_yaml::from_str(&content).with_context(|| format!("parsing {}", path.display()))?;
     Ok(cfg)
 }
 
