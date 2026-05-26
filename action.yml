@@ -42,12 +42,21 @@ inputs:
 runs:
   using: composite
   steps:
+    # Every `${{ inputs.* }}` value is funnelled through `env:` (where it
+    # becomes a literal string the shell can quote safely) rather than
+    # interpolated directly into the `run:` body. Inline `${{ }}` in a
+    # shell script is the script-injection class GitHub's hardening guide
+    # warns about — a caller workflow that ever ingests untrusted input
+    # (PR title, branch name, etc.) and forwards it to `with:` would
+    # otherwise be able to break out of our quoting.
     - name: Resolve lockfile
       id: resolve
       shell: bash
+      env:
+        INPUT_LOCKFILE: ${{ inputs.lockfile }}
       run: |
         set -euo pipefail
-        LOCK="${{ inputs.lockfile }}"
+        LOCK="$INPUT_LOCKFILE"
         if [ -z "$LOCK" ]; then
           for candidate in package-lock.json npm-shrinkwrap.json pnpm-lock.yaml yarn.lock; do
             if [ -f "$candidate" ]; then
@@ -64,6 +73,8 @@ runs:
 
     - name: Install pkgradar CLI
       shell: bash
+      env:
+        INPUT_VERSION: ${{ inputs.version }}
       run: |
         set -euo pipefail
         if command -v pkgradar >/dev/null 2>&1; then
@@ -71,7 +82,7 @@ runs:
           exit 0
         fi
 
-        VERSION='${{ inputs.version }}'
+        VERSION="$INPUT_VERSION"
         REPO='PkgRadar/pkgradar-cli'
 
         # Resolve `latest` to a concrete tag so the download URL is stable.
@@ -113,7 +124,7 @@ runs:
           fi
           if cargo install --git "https://github.com/${REPO}" pkgradar --locked; then
             installed=1
-          elif [ "$VERSION" = "" ] || [ "$VERSION" = "latest" ]; then
+          elif [ -z "$VERSION" ] || [ "$VERSION" = "latest" ]; then
             cargo install pkgradar --locked
           else
             cargo install pkgradar --version "$VERSION" --locked
@@ -126,16 +137,21 @@ runs:
       shell: bash
       env:
         PKGRADAR_TOKEN: ${{ inputs.token }}
+        INPUT_LOCKFILE: ${{ steps.resolve.outputs.lockfile }}
+        INPUT_FAIL_ON: ${{ inputs.fail-on }}
+        INPUT_CONFIG: ${{ inputs.config }}
+        INPUT_BASE_URL: ${{ inputs.base-url }}
+        INPUT_FAIL_OPEN: ${{ inputs.fail-open }}
       run: |
         set -euo pipefail
-        ARGS=(--lockfile '${{ steps.resolve.outputs.lockfile }}' --fail-on '${{ inputs.fail-on }}')
-        if [ -n "${{ inputs.config }}" ]; then
-          ARGS+=(--config '${{ inputs.config }}')
+        ARGS=(--lockfile "$INPUT_LOCKFILE" --fail-on "$INPUT_FAIL_ON")
+        if [ -n "$INPUT_CONFIG" ]; then
+          ARGS+=(--config "$INPUT_CONFIG")
         fi
-        if [ -n "${{ inputs.base-url }}" ]; then
-          export PKGRADAR_BASE_URL='${{ inputs.base-url }}'
+        if [ -n "$INPUT_BASE_URL" ]; then
+          export PKGRADAR_BASE_URL="$INPUT_BASE_URL"
         fi
-        if [ "${{ inputs.fail-open }}" != "true" ]; then
+        if [ "$INPUT_FAIL_OPEN" != "true" ]; then
           ARGS+=(--no-fail-open)
         fi
         pkgradar gate "${ARGS[@]}"

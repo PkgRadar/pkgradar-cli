@@ -1,0 +1,26 @@
+# Keep workflow + composite-action references up to date so a stale pin
+# doesn't ossify on a vulnerable version. Cargo deps already covered by
+# audit.yml's daily cargo-audit, but dependabot also opens grouped PRs
+# when transitive crates have new versions available.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      actions:
+        patterns:
+          - "*"
+
+  - package-ecosystem: cargo
+    directory: "/"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      cargo-minor:
+        update-types:
+          - minor
+          - patch
