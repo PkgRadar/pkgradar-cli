@@ -190,6 +190,17 @@ Prints the binary version and the resolved API endpoint.
 Maven specs use the `groupId:artifactId@version` shape, e.g.
 `com.fasterxml.jackson.core:jackson-databind@2.17.0`.
 
+### NuGet (.NET / nuget.org) ecosystem
+
+| Format                  | Supported                                                            |
+|-------------------------|----------------------------------------------------------------------|
+| `packages.lock.json`    | Yes (PackageReference lockfile; `type: Project` entries skipped)     |
+| `packages.config`       | Yes (legacy XML format)                                              |
+| `project.assets.json`   | Yes (resolved restore graph; `type: project` entries skipped)        |
+
+NuGet specs use `Id@Version`, e.g. `Newtonsoft.Json@13.0.3`. IDs are
+case-insensitive on the registry.
+
 The parser deduplicates by `(ecosystem, name, version)`, normalizes
 PyPI names per PEP 503, and skips non-registry refs (`file:`, `link:`,
 `workspace:`, `git+`, `github:`, direct URL specs).

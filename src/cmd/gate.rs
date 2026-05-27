@@ -23,7 +23,7 @@ pub struct GateArgs {
     /// cargo, and maven all use the `name@version` format so when
     /// ambiguous, this is how you disambiguate (maven specs are
     /// `groupId:artifactId@version`).
-    #[arg(long, value_parser = ["npm", "pypi", "rubygems", "cargo", "maven"])]
+    #[arg(long, value_parser = ["npm", "pypi", "rubygems", "cargo", "maven", "nuget"])]
     pub ecosystem: Option<String>,
 
     /// Block when a spec's risk is at or above this level. Overrides the
@@ -115,6 +115,7 @@ pub async fn run(args: GateArgs) -> Result<i32> {
         "rubygems" => Some(Ecosystem::Rubygems),
         "cargo" => Some(Ecosystem::Cargo),
         "maven" => Some(Ecosystem::Maven),
+        "nuget" => Some(Ecosystem::Nuget),
         _ => None,
     });
     for raw in args.specs.iter().chain(cfg.watchlist.iter()) {

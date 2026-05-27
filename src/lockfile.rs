@@ -26,6 +26,7 @@ pub enum Ecosystem {
     Rubygems,
     Cargo,
     Maven,
+    Nuget,
 }
 
 impl Ecosystem {
@@ -36,6 +37,7 @@ impl Ecosystem {
             Self::Rubygems => "rubygems",
             Self::Cargo => "cargo",
             Self::Maven => "maven",
+            Self::Nuget => "nuget",
         }
     }
 }
@@ -63,6 +65,10 @@ impl LockfileEntry {
             // Maven coordinates are `groupId:artifactId@version`; the
             // name field already contains `groupId:artifactId` here.
             Ecosystem::Maven => format!("{}@{}", self.name, self.version),
+            // NuGet IDs are case-insensitive but conventionally
+            // PascalCase. We store as-cased and let the server's
+            // canonical lower-case resolution match.
+            Ecosystem::Nuget => format!("{}@{}", self.name, self.version),
         }
     }
 }
@@ -80,6 +86,9 @@ enum LockfileKind {
     Gemfile,
     Cargo,
     Pom,
+    NugetLock,
+    NugetPackagesConfig,
+    NugetProjectAssets,
 }
 
 pub fn parse(path: &Path) -> Result<Vec<LockfileEntry>> {
@@ -98,6 +107,9 @@ pub fn parse(path: &Path) -> Result<Vec<LockfileEntry>> {
         LockfileKind::Gemfile => parse_gemfile_lock(&content)?,
         LockfileKind::Cargo => parse_cargo_lock(&content)?,
         LockfileKind::Pom => parse_pom_xml(&content)?,
+        LockfileKind::NugetLock => parse_nuget_lock(&content)?,
+        LockfileKind::NugetPackagesConfig => parse_nuget_packages_config(&content)?,
+        LockfileKind::NugetProjectAssets => parse_nuget_project_assets(&content)?,
     };
     let mut entries: Vec<LockfileEntry> = entries
         .into_iter()
@@ -149,6 +161,17 @@ pub fn parse(path: &Path) -> Result<Vec<LockfileEntry>> {
                         && !e.version.starts_with('(')
                         && e.name.contains(':')
                 }
+                Ecosystem::Nuget => {
+                    // Float versions (`1.0.0-*`) and version ranges
+                    // (`[1.0.0,)`) don't resolve to a single
+                    // version the gate can act on. The parser drops
+                    // those; this is the symmetry check.
+                    !e.name.is_empty()
+                        && !e.version.is_empty()
+                        && !e.version.contains('*')
+                        && !e.version.starts_with('[')
+                        && !e.version.starts_with('(')
+                }
             }
         })
         .collect();
@@ -186,10 +209,14 @@ fn detect_kind(path: &Path, content: &str) -> Result<LockfileKind> {
         "gemfile.lock" | "gems.locked" => Ok(LockfileKind::Gemfile),
         "cargo.lock" => Ok(LockfileKind::Cargo),
         "pom.xml" => Ok(LockfileKind::Pom),
+        "packages.lock.json" => Ok(LockfileKind::NugetLock),
+        "packages.config" => Ok(LockfileKind::NugetPackagesConfig),
+        "project.assets.json" => Ok(LockfileKind::NugetProjectAssets),
         _ => Err(anyhow!(
             "unrecognised lockfile name `{name}`. Supported: package-lock.json, \
              npm-shrinkwrap.json, pnpm-lock.yaml, yarn.lock, requirements.txt, \
-             Pipfile.lock, poetry.lock, uv.lock, pdm.lock, Gemfile.lock, Cargo.lock, pom.xml."
+             Pipfile.lock, poetry.lock, uv.lock, pdm.lock, Gemfile.lock, Cargo.lock, \
+             pom.xml, packages.lock.json, packages.config, project.assets.json."
         )),
     }
 }
@@ -632,6 +659,131 @@ fn parse_cargo_lock(content: &str) -> Result<Vec<LockfileEntry>> {
     Ok(entries)
 }
 
+// --- NuGet: packages.lock.json / packages.config / project.assets.json -
+
+/// Parse a NuGet `packages.lock.json` (PackageReference lockfile).
+/// Shape: `{ dependencies: { "<tfm>": { "Foo": { type, resolved,
+/// contentHash, ... } } } }`. We only care about `type:
+/// Direct|Transitive` entries with a `resolved` version.
+fn parse_nuget_lock(content: &str) -> Result<Vec<LockfileEntry>> {
+    let parsed: serde_json::Value =
+        serde_json::from_str(content).context("parsing packages.lock.json")?;
+    let mut entries = Vec::new();
+    let Some(deps) = parsed.get("dependencies").and_then(|v| v.as_object()) else {
+        return Ok(entries);
+    };
+    for (_tfm, tfm_deps) in deps {
+        let Some(tfm_obj) = tfm_deps.as_object() else {
+            continue;
+        };
+        for (name, info) in tfm_obj {
+            let Some(info_obj) = info.as_object() else {
+                continue;
+            };
+            let ty = info_obj.get("type").and_then(|v| v.as_str()).unwrap_or("");
+            // Project / project-reference entries aren't from the
+            // NuGet registry — skip.
+            if ty.eq_ignore_ascii_case("Project") {
+                continue;
+            }
+            let Some(resolved) = info_obj
+                .get("resolved")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+            else {
+                continue;
+            };
+            entries.push(LockfileEntry {
+                ecosystem: Ecosystem::Nuget,
+                name: name.to_string(),
+                version: resolved.to_string(),
+            });
+        }
+    }
+    Ok(entries)
+}
+
+/// Parse the legacy `packages.config`. XML of the shape
+/// `<packages><package id="Newtonsoft.Json" version="13.0.3" /></packages>`.
+/// The parser uses the same regex approach as pom.xml so we don't pull
+/// in a full XML dep.
+fn parse_nuget_packages_config(content: &str) -> Result<Vec<LockfileEntry>> {
+    let mut entries = Vec::new();
+    let stripped = strip_xml_comments(content);
+    let mut pos = 0;
+    while let Some(start) = stripped[pos..].find("<package ") {
+        let abs_start = pos + start;
+        // End of this <package> tag.
+        let Some(end_rel) = stripped[abs_start..].find('>') else {
+            break;
+        };
+        let tag = &stripped[abs_start..abs_start + end_rel + 1];
+        pos = abs_start + end_rel + 1;
+        let id = extract_xml_attr(tag, "id");
+        let version = extract_xml_attr(tag, "version");
+        let (Some(id), Some(version)) = (id, version) else {
+            continue;
+        };
+        entries.push(LockfileEntry {
+            ecosystem: Ecosystem::Nuget,
+            name: id,
+            version,
+        });
+    }
+    Ok(entries)
+}
+
+/// Parse `project.assets.json` (the NuGet restore graph). The
+/// resolved versions live under `libraries`, keyed `"Name/Version"`.
+/// We skip `type: project` entries which are local project refs.
+fn parse_nuget_project_assets(content: &str) -> Result<Vec<LockfileEntry>> {
+    let parsed: serde_json::Value =
+        serde_json::from_str(content).context("parsing project.assets.json")?;
+    let mut entries = Vec::new();
+    let Some(libs) = parsed.get("libraries").and_then(|v| v.as_object()) else {
+        return Ok(entries);
+    };
+    for (key, info) in libs {
+        let Some(info_obj) = info.as_object() else {
+            continue;
+        };
+        let ty = info_obj.get("type").and_then(|v| v.as_str()).unwrap_or("");
+        if ty.eq_ignore_ascii_case("project") {
+            continue;
+        }
+        let Some((name, version)) = key.split_once('/') else {
+            continue;
+        };
+        entries.push(LockfileEntry {
+            ecosystem: Ecosystem::Nuget,
+            name: name.to_string(),
+            version: version.to_string(),
+        });
+    }
+    Ok(entries)
+}
+
+fn extract_xml_attr(tag: &str, attr: &str) -> Option<String> {
+    // Match `attr="value"` or `attr='value'`. Defensive against
+    // attributes whose values contain quotes by stopping at the
+    // first closing quote of the same kind.
+    let needle = format!("{attr}=\"");
+    if let Some(start) = tag.find(&needle) {
+        let after = start + needle.len();
+        if let Some(end) = tag[after..].find('"') {
+            return Some(tag[after..after + end].to_string());
+        }
+    }
+    let needle = format!("{attr}='");
+    if let Some(start) = tag.find(&needle) {
+        let after = start + needle.len();
+        if let Some(end) = tag[after..].find('\'') {
+            return Some(tag[after..after + end].to_string());
+        }
+    }
+    None
+}
+
 // --- Maven: pom.xml ---------------------------------------------------
 
 /// Parse Maven's pom.xml for direct dependencies with concrete pinned
@@ -971,6 +1123,75 @@ version = "7.4.0"
         assert_eq!(normalize_pypi_name("zope.interface"), "zope-interface");
         assert_eq!(normalize_pypi_name("python__dateutil"), "python-dateutil");
         assert_eq!(normalize_pypi_name("a.b_c-d"), "a-b-c-d");
+    }
+
+    #[test]
+    fn nuget_packages_lock_parses() {
+        let content = r#"{
+            "version": 1,
+            "dependencies": {
+                "net8.0": {
+                    "Newtonsoft.Json": {
+                        "type": "Direct",
+                        "requested": "[13.0.3, )",
+                        "resolved": "13.0.3",
+                        "contentHash": "abc"
+                    },
+                    "System.Text.Json": {
+                        "type": "Transitive",
+                        "resolved": "8.0.0",
+                        "contentHash": "def"
+                    },
+                    "MyLocalProject": {
+                        "type": "Project"
+                    }
+                }
+            }
+        }"#;
+        let entries = parse_nuget_lock(content).unwrap();
+        let specs: Vec<String> = entries.iter().map(|e| e.spec()).collect();
+        assert!(specs.contains(&"Newtonsoft.Json@13.0.3".to_string()));
+        assert!(specs.contains(&"System.Text.Json@8.0.0".to_string()));
+        // Project refs → skipped.
+        assert!(!specs.iter().any(|s| s.starts_with("MyLocalProject@")));
+    }
+
+    #[test]
+    fn nuget_packages_config_parses() {
+        let content = r#"<?xml version="1.0" encoding="utf-8"?>
+<packages>
+  <package id="Newtonsoft.Json" version="13.0.3" targetFramework="net48" />
+  <package id="EntityFramework" version="6.4.4" targetFramework="net48" />
+  <!-- commented out -->
+  <!--<package id="Skipped" version="1.0.0" />-->
+</packages>"#;
+        let entries = parse_nuget_packages_config(content).unwrap();
+        let specs: Vec<String> = entries.iter().map(|e| e.spec()).collect();
+        assert!(specs.contains(&"Newtonsoft.Json@13.0.3".to_string()));
+        assert!(specs.contains(&"EntityFramework@6.4.4".to_string()));
+        assert!(!specs.iter().any(|s| s.starts_with("Skipped@")));
+    }
+
+    #[test]
+    fn nuget_project_assets_parses() {
+        let content = r#"{
+            "libraries": {
+                "Newtonsoft.Json/13.0.3": {
+                    "sha512": "abc",
+                    "type": "package",
+                    "path": "newtonsoft.json/13.0.3"
+                },
+                "MyApp/1.0.0": {
+                    "type": "project",
+                    "path": "../MyApp/MyApp.csproj"
+                }
+            }
+        }"#;
+        let entries = parse_nuget_project_assets(content).unwrap();
+        let specs: Vec<String> = entries.iter().map(|e| e.spec()).collect();
+        assert!(specs.contains(&"Newtonsoft.Json@13.0.3".to_string()));
+        // project type → skipped.
+        assert!(!specs.iter().any(|s| s.starts_with("MyApp@")));
     }
 
     #[test]
