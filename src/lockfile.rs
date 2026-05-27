@@ -24,6 +24,7 @@ pub enum Ecosystem {
     Npm,
     Pypi,
     Rubygems,
+    Cargo,
 }
 
 impl Ecosystem {
@@ -32,6 +33,7 @@ impl Ecosystem {
             Self::Npm => "npm",
             Self::Pypi => "pypi",
             Self::Rubygems => "rubygems",
+            Self::Cargo => "cargo",
         }
     }
 }
@@ -53,6 +55,9 @@ impl LockfileEntry {
             Ecosystem::Npm => format!("{}@{}", self.name, self.version),
             Ecosystem::Pypi => format!("{}=={}", self.name, self.version),
             Ecosystem::Rubygems => format!("{}@{}", self.name, self.version),
+            // Cargo uses `name@version` too — same shape as npm/gem
+            // but disambiguated via --ecosystem on bare CLI args.
+            Ecosystem::Cargo => format!("{}@{}", self.name, self.version),
         }
     }
 }
@@ -68,6 +73,7 @@ enum LockfileKind {
     PyUvLock,
     PyPdmLock,
     Gemfile,
+    Cargo,
 }
 
 pub fn parse(path: &Path) -> Result<Vec<LockfileEntry>> {
@@ -84,6 +90,7 @@ pub fn parse(path: &Path) -> Result<Vec<LockfileEntry>> {
         LockfileKind::PyUvLock => parse_uv_lock(&content)?,
         LockfileKind::PyPdmLock => parse_pdm_lock(&content)?,
         LockfileKind::Gemfile => parse_gemfile_lock(&content)?,
+        LockfileKind::Cargo => parse_cargo_lock(&content)?,
     };
     let mut entries: Vec<LockfileEntry> = entries
         .into_iter()
@@ -117,6 +124,13 @@ pub fn parse(path: &Path) -> Result<Vec<LockfileEntry>> {
                     // in parse_gemfile_lock; this filter is a final
                     // sanity check.
                     !e.name.contains('/') && !e.name.is_empty()
+                }
+                Ecosystem::Cargo => {
+                    // git/path/workspace sources are filtered upstream
+                    // in parse_cargo_lock by skipping entries whose
+                    // `source` is anything other than the crates.io
+                    // registry sentinel.
+                    !e.name.is_empty() && !e.version.is_empty()
                 }
             }
         })
@@ -153,10 +167,11 @@ fn detect_kind(path: &Path, content: &str) -> Result<LockfileKind> {
         "uv.lock" => Ok(LockfileKind::PyUvLock),
         "pdm.lock" => Ok(LockfileKind::PyPdmLock),
         "gemfile.lock" | "gems.locked" => Ok(LockfileKind::Gemfile),
+        "cargo.lock" => Ok(LockfileKind::Cargo),
         _ => Err(anyhow!(
             "unrecognised lockfile name `{name}`. Supported: package-lock.json, \
              npm-shrinkwrap.json, pnpm-lock.yaml, yarn.lock, requirements.txt, \
-             Pipfile.lock, poetry.lock, uv.lock, pdm.lock, Gemfile.lock."
+             Pipfile.lock, poetry.lock, uv.lock, pdm.lock, Gemfile.lock, Cargo.lock."
         )),
     }
 }
@@ -553,6 +568,52 @@ fn parse_pdm_lock(content: &str) -> Result<Vec<LockfileEntry>> {
     parse_toml_package_array(content)
 }
 
+// --- Cargo: Cargo.lock --------------------------------------------------
+
+/// Parse a Cargo.lock. The format is TOML with a top-level array of
+/// `[[package]]` tables: `name`, `version`, `source`, and
+/// `checksum`. Only entries whose `source` is the crates.io registry
+/// sentinel (`registry+https://github.com/rust-lang/crates.io-index`
+/// or the newer `sparse+https://index.crates.io/`) are gated. Git,
+/// path, and workspace-local crates have no source recorded the
+/// gate can consult, so we skip them.
+fn parse_cargo_lock(content: &str) -> Result<Vec<LockfileEntry>> {
+    let parsed: toml::Value = toml::from_str(content).context("parsing Cargo.lock")?;
+    let mut entries = Vec::new();
+    let Some(packages) = parsed.get("package").and_then(|v| v.as_array()) else {
+        return Ok(entries);
+    };
+    for pkg in packages {
+        let Some(table) = pkg.as_table() else {
+            continue;
+        };
+        let Some(name) = table.get("name").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let Some(version) = table.get("version").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        // The workspace's own crates (your code under [workspace] /
+        // [package]) appear in Cargo.lock with no `source` field.
+        // Don't gate those — they're not registry-resolved.
+        let source = table.get("source").and_then(|v| v.as_str()).unwrap_or("");
+        if source.is_empty() {
+            continue;
+        }
+        // Only registry sources go through the gate. git+ssh, git+
+        // https, path+, etc. are not registry-shaped.
+        if !source.starts_with("registry+") && !source.starts_with("sparse+") {
+            continue;
+        }
+        entries.push(LockfileEntry {
+            ecosystem: Ecosystem::Cargo,
+            name: name.to_string(),
+            version: version.to_string(),
+        });
+    }
+    Ok(entries)
+}
+
 // --- RubyGems: Gemfile.lock --------------------------------------------
 
 /// Parse Bundler's `Gemfile.lock`. The interesting section is `GEM`,
@@ -755,6 +816,44 @@ version = "7.4.0"
         assert_eq!(normalize_pypi_name("zope.interface"), "zope-interface");
         assert_eq!(normalize_pypi_name("python__dateutil"), "python-dateutil");
         assert_eq!(normalize_pypi_name("a.b_c-d"), "a-b-c-d");
+    }
+
+    #[test]
+    fn cargo_lock_parses() {
+        let content = r#"
+version = 3
+
+[[package]]
+name = "myapp"
+version = "0.1.0"
+dependencies = ["serde"]
+
+[[package]]
+name = "serde"
+version = "1.0.219"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "abc"
+
+[[package]]
+name = "anyhow"
+version = "1.0.102"
+source = "sparse+https://index.crates.io/"
+checksum = "def"
+
+[[package]]
+name = "private-lib"
+version = "0.1.0"
+source = "git+https://github.com/example/private-lib.git#deadbeef"
+"#;
+        let entries = parse_cargo_lock(content).unwrap();
+        let specs: Vec<String> = entries.iter().map(|e| e.spec()).collect();
+        // Workspace crate (no `source`) → skipped.
+        assert!(!specs.iter().any(|s| s.starts_with("myapp@")));
+        // crates.io registry entries → kept.
+        assert!(specs.contains(&"serde@1.0.219".to_string()));
+        assert!(specs.contains(&"anyhow@1.0.102".to_string()));
+        // git-sourced crate → skipped.
+        assert!(!specs.iter().any(|s| s.starts_with("private-lib@")));
     }
 
     #[test]

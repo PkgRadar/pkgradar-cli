@@ -19,10 +19,10 @@ pub struct GateArgs {
     #[arg(num_args = 0..)]
     pub specs: Vec<String>,
 
-    /// Force the ecosystem for positional specs. npm and rubygems
-    /// both use the `name@version` format so when ambiguous, this
-    /// is how you disambiguate.
-    #[arg(long, value_parser = ["npm", "pypi", "rubygems"])]
+    /// Force the ecosystem for positional specs. npm, rubygems, and
+    /// cargo all use the `name@version` format so when ambiguous,
+    /// this is how you disambiguate.
+    #[arg(long, value_parser = ["npm", "pypi", "rubygems", "cargo"])]
     pub ecosystem: Option<String>,
 
     /// Block when a spec's risk is at or above this level. Overrides the
@@ -112,6 +112,7 @@ pub async fn run(args: GateArgs) -> Result<i32> {
         "npm" => Some(Ecosystem::Npm),
         "pypi" => Some(Ecosystem::Pypi),
         "rubygems" => Some(Ecosystem::Rubygems),
+        "cargo" => Some(Ecosystem::Cargo),
         _ => None,
     });
     for raw in args.specs.iter().chain(cfg.watchlist.iter()) {

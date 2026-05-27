@@ -175,6 +175,12 @@ Prints the binary version and the resolved API endpoint.
 | `Gemfile.lock`  | Yes (GEM block, registry-resolved pins; GIT/PATH/PLUGIN sources skipped)        |
 | `gems.locked`   | Yes                                                                             |
 
+### Cargo (Rust / crates.io) ecosystem
+
+| Format        | Supported                                                                |
+|---------------|--------------------------------------------------------------------------|
+| `Cargo.lock`  | Yes (registry+ and sparse+ sources; git+ and workspace crates skipped)  |
+
 The parser deduplicates by `(ecosystem, name, version)`, normalizes
 PyPI names per PEP 503, and skips non-registry refs (`file:`, `link:`,
 `workspace:`, `git+`, `github:`, direct URL specs).
