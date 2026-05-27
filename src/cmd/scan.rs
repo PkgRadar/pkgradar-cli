@@ -16,9 +16,10 @@ pub struct ScanArgs {
     #[arg(num_args = 0..)]
     pub specs: Vec<String>,
 
-    /// Force the ecosystem for positional specs. npm, rubygems, and
-    /// cargo all use `name@version`, so disambiguate with this flag.
-    #[arg(long, value_parser = ["npm", "pypi", "rubygems", "cargo"])]
+    /// Force the ecosystem for positional specs. npm, rubygems,
+    /// cargo, and maven all use `name@version` shape, so this
+    /// disambiguates. (Maven specs look like `group:artifact@version`.)
+    #[arg(long, value_parser = ["npm", "pypi", "rubygems", "cargo", "maven"])]
     pub ecosystem: Option<String>,
 
     /// Path to a lockfile to scan. Auto-detects npm, pnpm, yarn-classic,
@@ -50,6 +51,7 @@ pub async fn run(args: ScanArgs) -> Result<i32> {
         "pypi" => Some(Ecosystem::Pypi),
         "rubygems" => Some(Ecosystem::Rubygems),
         "cargo" => Some(Ecosystem::Cargo),
+        "maven" => Some(Ecosystem::Maven),
         _ => None,
     });
     for raw in &args.specs {

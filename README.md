@@ -181,6 +181,15 @@ Prints the binary version and the resolved API endpoint.
 |---------------|--------------------------------------------------------------------------|
 | `Cargo.lock`  | Yes (registry+ and sparse+ sources; git+ and workspace crates skipped)  |
 
+### Maven (Java / Maven Central) ecosystem
+
+| Format     | Supported                                                                                  |
+|------------|--------------------------------------------------------------------------------------------|
+| `pom.xml`  | Yes — `<dependency>` blocks with concrete pinned versions; `${prop}` / `[1,2)` ranges skipped, `<dependencyManagement>` ignored |
+
+Maven specs use the `groupId:artifactId@version` shape, e.g.
+`com.fasterxml.jackson.core:jackson-databind@2.17.0`.
+
 The parser deduplicates by `(ecosystem, name, version)`, normalizes
 PyPI names per PEP 503, and skips non-registry refs (`file:`, `link:`,
 `workspace:`, `git+`, `github:`, direct URL specs).

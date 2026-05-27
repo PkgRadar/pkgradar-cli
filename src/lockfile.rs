@@ -25,6 +25,7 @@ pub enum Ecosystem {
     Pypi,
     Rubygems,
     Cargo,
+    Maven,
 }
 
 impl Ecosystem {
@@ -34,6 +35,7 @@ impl Ecosystem {
             Self::Pypi => "pypi",
             Self::Rubygems => "rubygems",
             Self::Cargo => "cargo",
+            Self::Maven => "maven",
         }
     }
 }
@@ -58,6 +60,9 @@ impl LockfileEntry {
             // Cargo uses `name@version` too — same shape as npm/gem
             // but disambiguated via --ecosystem on bare CLI args.
             Ecosystem::Cargo => format!("{}@{}", self.name, self.version),
+            // Maven coordinates are `groupId:artifactId@version`; the
+            // name field already contains `groupId:artifactId` here.
+            Ecosystem::Maven => format!("{}@{}", self.name, self.version),
         }
     }
 }
@@ -74,6 +79,7 @@ enum LockfileKind {
     PyPdmLock,
     Gemfile,
     Cargo,
+    Pom,
 }
 
 pub fn parse(path: &Path) -> Result<Vec<LockfileEntry>> {
@@ -91,6 +97,7 @@ pub fn parse(path: &Path) -> Result<Vec<LockfileEntry>> {
         LockfileKind::PyPdmLock => parse_pdm_lock(&content)?,
         LockfileKind::Gemfile => parse_gemfile_lock(&content)?,
         LockfileKind::Cargo => parse_cargo_lock(&content)?,
+        LockfileKind::Pom => parse_pom_xml(&content)?,
     };
     let mut entries: Vec<LockfileEntry> = entries
         .into_iter()
@@ -132,6 +139,16 @@ pub fn parse(path: &Path) -> Result<Vec<LockfileEntry>> {
                     // registry sentinel.
                     !e.name.is_empty() && !e.version.is_empty()
                 }
+                Ecosystem::Maven => {
+                    // ${prop} interpolated versions never gate
+                    // cleanly because the gate has no way to resolve
+                    // them; parse_pom_xml drops those at parse time.
+                    // This filter keeps the contract symmetric.
+                    !e.version.starts_with("${")
+                        && !e.version.starts_with('[')
+                        && !e.version.starts_with('(')
+                        && e.name.contains(':')
+                }
             }
         })
         .collect();
@@ -168,10 +185,11 @@ fn detect_kind(path: &Path, content: &str) -> Result<LockfileKind> {
         "pdm.lock" => Ok(LockfileKind::PyPdmLock),
         "gemfile.lock" | "gems.locked" => Ok(LockfileKind::Gemfile),
         "cargo.lock" => Ok(LockfileKind::Cargo),
+        "pom.xml" => Ok(LockfileKind::Pom),
         _ => Err(anyhow!(
             "unrecognised lockfile name `{name}`. Supported: package-lock.json, \
              npm-shrinkwrap.json, pnpm-lock.yaml, yarn.lock, requirements.txt, \
-             Pipfile.lock, poetry.lock, uv.lock, pdm.lock, Gemfile.lock, Cargo.lock."
+             Pipfile.lock, poetry.lock, uv.lock, pdm.lock, Gemfile.lock, Cargo.lock, pom.xml."
         )),
     }
 }
@@ -614,6 +632,143 @@ fn parse_cargo_lock(content: &str) -> Result<Vec<LockfileEntry>> {
     Ok(entries)
 }
 
+// --- Maven: pom.xml ---------------------------------------------------
+
+/// Parse Maven's pom.xml for direct dependencies with concrete pinned
+/// versions. Real Maven projects rarely commit a lockfile, so the
+/// `pom.xml` itself is the closest thing the gate can consume.
+///
+/// We extract groupId / artifactId / version triples from
+/// `<dependency>` blocks; `<dependencyManagement>` declarations are
+/// skipped because they're version-pins-for-children, not actual
+/// resolved dependencies of the current project. Version property
+/// references (`${spring.version}`) and version ranges
+/// (`[1.0,2.0)`, `(0,)`) are also skipped — the gate can only act
+/// on a fully concrete coordinate.
+///
+/// XML parsing here is intentionally minimal (regex over the source).
+/// A full XML parser would also handle namespaces, comments, and
+/// CDATA, but the worst we can do with regex is drop a dep — never
+/// produce a wrong one. Keeping the dep surface small is the
+/// security-first choice.
+fn parse_pom_xml(content: &str) -> Result<Vec<LockfileEntry>> {
+    let mut entries = Vec::new();
+
+    // First strip <dependencyManagement> blocks so we don't pick up
+    // their inner <dependency> declarations. The block can be
+    // arbitrarily-nested but in practice never contains another
+    // <dependencyManagement>, so a single greedy strip is fine.
+    let stripped = strip_xml_block(content, "dependencyManagement");
+
+    // Strip XML comments too — sometimes folks comment-out deps and
+    // we don't want to accidentally surface them.
+    let stripped = strip_xml_comments(&stripped);
+
+    // Now iterate <dependency>...</dependency> blocks. The same
+    // block can appear inside <plugin> declarations too — those are
+    // build-time plugin deps which we still gate (a malicious build
+    // plugin is the canonical Maven supply-chain attack).
+    let mut pos = 0;
+    while let Some(start) = stripped[pos..].find("<dependency>") {
+        let abs_start = pos + start + "<dependency>".len();
+        let Some(end) = stripped[abs_start..].find("</dependency>") else {
+            break;
+        };
+        let block = &stripped[abs_start..abs_start + end];
+        pos = abs_start + end + "</dependency>".len();
+        let Some(group) = xml_inner_text(block, "groupId") else {
+            continue;
+        };
+        let Some(artifact) = xml_inner_text(block, "artifactId") else {
+            continue;
+        };
+        let Some(version) = xml_inner_text(block, "version") else {
+            // Maven inherits versions from parent POMs and BOMs when
+            // no <version> is given. The gate has no way to resolve
+            // that, so skip silently.
+            continue;
+        };
+        let group = group.trim();
+        let artifact = artifact.trim();
+        let version = version.trim();
+        if group.is_empty() || artifact.is_empty() || version.is_empty() {
+            continue;
+        }
+        // Skip property references and version ranges; both need
+        // resolution we can't perform from pom.xml alone.
+        if version.starts_with("${")
+            || version.starts_with('[')
+            || version.starts_with('(')
+            || version.contains(',')
+        {
+            continue;
+        }
+        entries.push(LockfileEntry {
+            ecosystem: Ecosystem::Maven,
+            name: format!("{group}:{artifact}"),
+            version: version.to_string(),
+        });
+    }
+    Ok(entries)
+}
+
+/// Best-effort strip of a top-level XML block by name. Used to drop
+/// `<dependencyManagement>...</dependencyManagement>` before the
+/// dependency-scanner walks the remaining text. Handles a single
+/// well-formed nesting; if the block is malformed we return the
+/// content unchanged so the dep scanner still sees something.
+fn strip_xml_block(content: &str, name: &str) -> String {
+    let open = format!("<{name}>");
+    let close = format!("</{name}>");
+    let mut out = String::with_capacity(content.len());
+    let mut pos = 0;
+    while let Some(start) = content[pos..].find(&open) {
+        let abs_start = pos + start;
+        out.push_str(&content[pos..abs_start]);
+        let after_open = abs_start + open.len();
+        let Some(end_rel) = content[after_open..].find(&close) else {
+            // Malformed — keep the rest of the document so we don't
+            // silently lose dependency entries downstream.
+            out.push_str(&content[abs_start..]);
+            return out;
+        };
+        pos = after_open + end_rel + close.len();
+    }
+    out.push_str(&content[pos..]);
+    out
+}
+
+fn strip_xml_comments(content: &str) -> String {
+    let mut out = String::with_capacity(content.len());
+    let mut pos = 0;
+    while let Some(start) = content[pos..].find("<!--") {
+        let abs_start = pos + start;
+        out.push_str(&content[pos..abs_start]);
+        let after_open = abs_start + 4;
+        let Some(end_rel) = content[after_open..].find("-->") else {
+            out.push_str(&content[abs_start..]);
+            return out;
+        };
+        pos = after_open + end_rel + 3;
+    }
+    out.push_str(&content[pos..]);
+    out
+}
+
+/// Return the first inner text of a top-level child tag named
+/// `tag` inside `block`. Doesn't try to handle namespaces — Maven
+/// poms typically use the default namespace, and our tag names
+/// (groupId/artifactId/version) don't appear with prefixes in
+/// real-world poms.
+fn xml_inner_text(block: &str, tag: &str) -> Option<String> {
+    let open = format!("<{tag}>");
+    let close = format!("</{tag}>");
+    let start = block.find(&open)?;
+    let inner_start = start + open.len();
+    let end = block[inner_start..].find(&close)?;
+    Some(block[inner_start..inner_start + end].to_string())
+}
+
 // --- RubyGems: Gemfile.lock --------------------------------------------
 
 /// Parse Bundler's `Gemfile.lock`. The interesting section is `GEM`,
@@ -816,6 +971,72 @@ version = "7.4.0"
         assert_eq!(normalize_pypi_name("zope.interface"), "zope-interface");
         assert_eq!(normalize_pypi_name("python__dateutil"), "python-dateutil");
         assert_eq!(normalize_pypi_name("a.b_c-d"), "a-b-c-d");
+    }
+
+    #[test]
+    fn pom_xml_parses() {
+        let content = r#"<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0">
+  <modelVersion>4.0.0</modelVersion>
+  <groupId>com.example</groupId>
+  <artifactId>myapp</artifactId>
+  <version>0.1.0-SNAPSHOT</version>
+
+  <dependencyManagement>
+    <dependencies>
+      <dependency>
+        <groupId>org.springframework</groupId>
+        <artifactId>spring-bom</artifactId>
+        <version>5.3.30</version>
+        <type>pom</type>
+        <scope>import</scope>
+      </dependency>
+    </dependencies>
+  </dependencyManagement>
+
+  <dependencies>
+    <!-- pinned, registry-resolved -->
+    <dependency>
+      <groupId>com.fasterxml.jackson.core</groupId>
+      <artifactId>jackson-databind</artifactId>
+      <version>2.17.0</version>
+    </dependency>
+    <dependency>
+      <groupId>org.apache.logging.log4j</groupId>
+      <artifactId>log4j-core</artifactId>
+      <version>2.20.0</version>
+    </dependency>
+    <!-- ${prop} version → skipped -->
+    <dependency>
+      <groupId>org.junit.jupiter</groupId>
+      <artifactId>junit-jupiter</artifactId>
+      <version>${junit.version}</version>
+    </dependency>
+    <!-- version range → skipped -->
+    <dependency>
+      <groupId>commons-lang</groupId>
+      <artifactId>commons-lang</artifactId>
+      <version>[2.6,3.0)</version>
+    </dependency>
+    <!-- no version (inherits from parent/bom) → skipped -->
+    <dependency>
+      <groupId>org.springframework</groupId>
+      <artifactId>spring-core</artifactId>
+    </dependency>
+  </dependencies>
+</project>"#;
+        let entries = parse_pom_xml(content).unwrap();
+        let specs: Vec<String> = entries.iter().map(|e| e.spec()).collect();
+        assert!(specs.contains(&"com.fasterxml.jackson.core:jackson-databind@2.17.0".to_string()));
+        assert!(specs.contains(&"org.apache.logging.log4j:log4j-core@2.20.0".to_string()));
+        // dependencyManagement → not gated.
+        assert!(!specs.iter().any(|s| s.contains("spring-bom")));
+        // ${prop} version → skipped.
+        assert!(!specs.iter().any(|s| s.contains("junit-jupiter")));
+        // version range → skipped.
+        assert!(!specs.iter().any(|s| s.contains("commons-lang")));
+        // missing <version> → skipped.
+        assert!(!specs.iter().any(|s| s.contains("spring-core")));
     }
 
     #[test]
