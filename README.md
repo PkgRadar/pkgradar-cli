@@ -201,6 +201,14 @@ Maven specs use the `groupId:artifactId@version` shape, e.g.
 NuGet specs use `Id@Version`, e.g. `Newtonsoft.Json@13.0.3`. IDs are
 case-insensitive on the registry.
 
+### Composer (PHP / Packagist) ecosystem
+
+| Format          | Supported                                                                                |
+|-----------------|------------------------------------------------------------------------------------------|
+| `composer.lock` | Yes (`packages` + `packages-dev` arrays; `metapackage` and `dev-*` refs skipped)         |
+
+Composer specs use `vendor/name@version`, e.g. `symfony/console@v6.4.1`.
+
 The parser deduplicates by `(ecosystem, name, version)`, normalizes
 PyPI names per PEP 503, and skips non-registry refs (`file:`, `link:`,
 `workspace:`, `git+`, `github:`, direct URL specs).

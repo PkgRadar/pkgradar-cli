@@ -1,11 +1,11 @@
 name: PkgRadar Gate
 description: >-
-  Block CI when an npm, PyPI, RubyGems, Cargo, Maven, or NuGet dependency
-  upgrade matches PkgRadar's static evidence thresholds. Auto-detects
-  package-lock.json, pnpm-lock.yaml, yarn.lock, requirements.txt,
-  Pipfile.lock, poetry.lock, uv.lock, pdm.lock, Gemfile.lock, Cargo.lock,
-  pom.xml, packages.lock.json, packages.config, or project.assets.json in
-  the working dir.
+  Block CI when an npm, PyPI, RubyGems, Cargo, Maven, NuGet, or Composer
+  dependency upgrade matches PkgRadar's static evidence thresholds.
+  Auto-detects package-lock.json, pnpm-lock.yaml, yarn.lock,
+  requirements.txt, Pipfile.lock, poetry.lock, uv.lock, pdm.lock,
+  Gemfile.lock, Cargo.lock, pom.xml, packages.lock.json, packages.config,
+  project.assets.json, or composer.lock in the working dir.
 author: PkgRadar
 branding:
   icon: shield
@@ -20,7 +20,8 @@ inputs:
       Path to a lockfile. Auto-detects package-lock.json, pnpm-lock.yaml,
       yarn.lock, requirements.txt, Pipfile.lock, poetry.lock, uv.lock,
       pdm.lock, Gemfile.lock, Cargo.lock, pom.xml, packages.lock.json,
-      packages.config, or project.assets.json in the working dir when unset.
+      packages.config, project.assets.json, or composer.lock in the working
+      dir when unset.
     required: false
   fail-on:
     description: Block when a spec's risk is at or above this level (low | review | high).
@@ -73,7 +74,8 @@ runs:
               Gemfile.lock gems.locked \
               Cargo.lock \
               pom.xml \
-              packages.lock.json packages.config project.assets.json; do
+              packages.lock.json packages.config project.assets.json \
+              composer.lock; do
             if [ -f "$candidate" ]; then
               LOCK="$candidate"
               break
@@ -81,7 +83,7 @@ runs:
           done
         fi
         if [ -z "$LOCK" ] || [ ! -f "$LOCK" ]; then
-          echo '::error::No lockfile found. Pass `lockfile:` explicitly or commit a supported lockfile (package-lock.json, pnpm-lock.yaml, yarn.lock, requirements.txt, Pipfile.lock, poetry.lock, uv.lock, pdm.lock, Gemfile.lock, Cargo.lock, pom.xml, packages.lock.json, packages.config, or project.assets.json).'
+          echo '::error::No lockfile found. Pass `lockfile:` explicitly or commit a supported lockfile (package-lock.json, pnpm-lock.yaml, yarn.lock, requirements.txt, Pipfile.lock, poetry.lock, uv.lock, pdm.lock, Gemfile.lock, Cargo.lock, pom.xml, packages.lock.json, packages.config, project.assets.json, or composer.lock).'
           exit 2
         fi
         echo "lockfile=$LOCK" >> "$GITHUB_OUTPUT"

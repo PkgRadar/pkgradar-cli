@@ -27,6 +27,7 @@ pub enum Ecosystem {
     Cargo,
     Maven,
     Nuget,
+    Composer,
 }
 
 impl Ecosystem {
@@ -38,6 +39,7 @@ impl Ecosystem {
             Self::Cargo => "cargo",
             Self::Maven => "maven",
             Self::Nuget => "nuget",
+            Self::Composer => "composer",
         }
     }
 }
@@ -69,6 +71,9 @@ impl LockfileEntry {
             // PascalCase. We store as-cased and let the server's
             // canonical lower-case resolution match.
             Ecosystem::Nuget => format!("{}@{}", self.name, self.version),
+            // Composer package names are vendor/package, e.g.
+            // `symfony/console`. Spec format is `vendor/name@version`.
+            Ecosystem::Composer => format!("{}@{}", self.name, self.version),
         }
     }
 }
@@ -89,6 +94,7 @@ enum LockfileKind {
     NugetLock,
     NugetPackagesConfig,
     NugetProjectAssets,
+    ComposerLock,
 }
 
 pub fn parse(path: &Path) -> Result<Vec<LockfileEntry>> {
@@ -110,6 +116,7 @@ pub fn parse(path: &Path) -> Result<Vec<LockfileEntry>> {
         LockfileKind::NugetLock => parse_nuget_lock(&content)?,
         LockfileKind::NugetPackagesConfig => parse_nuget_packages_config(&content)?,
         LockfileKind::NugetProjectAssets => parse_nuget_project_assets(&content)?,
+        LockfileKind::ComposerLock => parse_composer_lock(&content)?,
     };
     let mut entries: Vec<LockfileEntry> = entries
         .into_iter()
@@ -172,6 +179,15 @@ pub fn parse(path: &Path) -> Result<Vec<LockfileEntry>> {
                         && !e.version.starts_with('[')
                         && !e.version.starts_with('(')
                 }
+                Ecosystem::Composer => {
+                    // Composer dev branches (`dev-master`,
+                    // `dev-main`) are mutable refs — skip. Real
+                    // semver pins like `v6.4.1` / `6.4.1` go through.
+                    !e.name.is_empty()
+                        && !e.version.is_empty()
+                        && !e.version.starts_with("dev-")
+                        && e.name.contains('/')
+                }
             }
         })
         .collect();
@@ -212,11 +228,13 @@ fn detect_kind(path: &Path, content: &str) -> Result<LockfileKind> {
         "packages.lock.json" => Ok(LockfileKind::NugetLock),
         "packages.config" => Ok(LockfileKind::NugetPackagesConfig),
         "project.assets.json" => Ok(LockfileKind::NugetProjectAssets),
+        "composer.lock" => Ok(LockfileKind::ComposerLock),
         _ => Err(anyhow!(
             "unrecognised lockfile name `{name}`. Supported: package-lock.json, \
              npm-shrinkwrap.json, pnpm-lock.yaml, yarn.lock, requirements.txt, \
              Pipfile.lock, poetry.lock, uv.lock, pdm.lock, Gemfile.lock, Cargo.lock, \
-             pom.xml, packages.lock.json, packages.config, project.assets.json."
+             pom.xml, packages.lock.json, packages.config, project.assets.json, \
+             composer.lock."
         )),
     }
 }
@@ -655,6 +673,50 @@ fn parse_cargo_lock(content: &str) -> Result<Vec<LockfileEntry>> {
             name: name.to_string(),
             version: version.to_string(),
         });
+    }
+    Ok(entries)
+}
+
+// --- Composer: composer.lock ------------------------------------------
+
+/// Parse a `composer.lock` (PHP / Packagist). Shape:
+/// `{ "packages": [ { "name": "vendor/pkg", "version": "v6.4.1",
+/// "source": { ... }, "dist": { ... }, "type": "library" }, ... ],
+/// "packages-dev": [ ... ] }`. Both arrays gate the same way — a
+/// malicious dev-only dep is just as bad in CI.
+fn parse_composer_lock(content: &str) -> Result<Vec<LockfileEntry>> {
+    let parsed: serde_json::Value =
+        serde_json::from_str(content).context("parsing composer.lock")?;
+    let mut entries = Vec::new();
+    for section in ["packages", "packages-dev"] {
+        let Some(list) = parsed.get(section).and_then(|v| v.as_array()) else {
+            continue;
+        };
+        for pkg in list {
+            let Some(obj) = pkg.as_object() else {
+                continue;
+            };
+            let Some(name) = obj.get("name").and_then(|v| v.as_str()) else {
+                continue;
+            };
+            let Some(version) = obj.get("version").and_then(|v| v.as_str()) else {
+                continue;
+            };
+            // Skip metapackages (they ship no code, just declare
+            // composition) and dev-master / dev-main refs.
+            let ty = obj.get("type").and_then(|v| v.as_str()).unwrap_or("");
+            if ty == "metapackage" {
+                continue;
+            }
+            if version.starts_with("dev-") {
+                continue;
+            }
+            entries.push(LockfileEntry {
+                ecosystem: Ecosystem::Composer,
+                name: name.to_string(),
+                version: version.to_string(),
+            });
+        }
     }
     Ok(entries)
 }
@@ -1123,6 +1185,30 @@ version = "7.4.0"
         assert_eq!(normalize_pypi_name("zope.interface"), "zope-interface");
         assert_eq!(normalize_pypi_name("python__dateutil"), "python-dateutil");
         assert_eq!(normalize_pypi_name("a.b_c-d"), "a-b-c-d");
+    }
+
+    #[test]
+    fn composer_lock_parses() {
+        let content = r#"{
+            "packages": [
+                {"name": "symfony/console", "version": "v6.4.1", "type": "library"},
+                {"name": "monolog/monolog", "version": "3.5.0", "type": "library"},
+                {"name": "foo/bar", "version": "dev-main", "type": "library"},
+                {"name": "fake/meta", "version": "1.0.0", "type": "metapackage"}
+            ],
+            "packages-dev": [
+                {"name": "phpunit/phpunit", "version": "10.5.0", "type": "library"}
+            ]
+        }"#;
+        let entries = parse_composer_lock(content).unwrap();
+        let specs: Vec<String> = entries.iter().map(|e| e.spec()).collect();
+        assert!(specs.contains(&"symfony/console@v6.4.1".to_string()));
+        assert!(specs.contains(&"monolog/monolog@3.5.0".to_string()));
+        assert!(specs.contains(&"phpunit/phpunit@10.5.0".to_string()));
+        // dev-main → skipped
+        assert!(!specs.iter().any(|s| s.contains("foo/bar")));
+        // metapackage → skipped
+        assert!(!specs.iter().any(|s| s.contains("fake/meta")));
     }
 
     #[test]
