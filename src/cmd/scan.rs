@@ -82,19 +82,24 @@ pub async fn run(args: ScanArgs) -> Result<i32> {
         args.common.timeout_ms,
     )?;
 
+    // Same per-request cap as the gate endpoint — chunk so large lockfiles
+    // don't trip a 413.
+    const SCAN_BATCH: usize = 25;
     let mut all_reports: Vec<Value> = Vec::new();
     for (ecosystem, specs) in &buckets {
-        let response = client.scan(ecosystem.as_str(), specs).await?;
-        for mut r in response.reports {
-            if r.get("ecosystem").is_none() {
-                if let Some(obj) = r.as_object_mut() {
-                    obj.insert(
-                        "ecosystem".to_string(),
-                        Value::String(ecosystem.as_str().to_string()),
-                    );
+        for chunk in specs.chunks(SCAN_BATCH) {
+            let response = client.scan(ecosystem.as_str(), chunk).await?;
+            for mut r in response.reports {
+                if r.get("ecosystem").is_none() {
+                    if let Some(obj) = r.as_object_mut() {
+                        obj.insert(
+                            "ecosystem".to_string(),
+                            Value::String(ecosystem.as_str().to_string()),
+                        );
+                    }
                 }
+                all_reports.push(r);
             }
-            all_reports.push(r);
         }
     }
 

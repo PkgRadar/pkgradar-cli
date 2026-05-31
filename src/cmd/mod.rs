@@ -28,8 +28,10 @@ pub struct CommonArgs {
     )]
     pub base_url: String,
 
-    /// HTTP timeout in milliseconds, per request.
-    #[arg(long, default_value_t = 8000)]
+    /// HTTP timeout in milliseconds, per request. Default is generous
+    /// because a cold gate batch triggers first-time live scans server-side
+    /// (fetch + analyze each tarball); repeat runs hit the cache and are fast.
+    #[arg(long, default_value_t = 60000)]
     pub timeout_ms: u64,
 
     /// Output format.

@@ -67,7 +67,7 @@ pub async fn run(args: GateArgs) -> Result<i32> {
         .or_else(|| cfg.fail_on.clone())
         .unwrap_or_else(|| "high".to_string());
 
-    let timeout_ms = if args.common.timeout_ms != 8000 {
+    let timeout_ms = if args.common.timeout_ms != 60000 {
         args.common.timeout_ms
     } else {
         cfg.timeout_ms.unwrap_or(args.common.timeout_ms)
@@ -150,46 +150,61 @@ pub async fn run(args: GateArgs) -> Result<i32> {
     let mut combined_reports: Vec<Value> = Vec::new();
     let mut last_fail_on = fail_on.clone();
 
+    // The gate endpoint caps each request at GATE_BATCH specs (tuned to the
+    // server-side scan concurrency + the per-request timeout), so a real
+    // lockfile must be sent in chunks. Sending the whole bucket in one call
+    // previously tripped a 413 and — with fail-open — silently passed the
+    // entire build unchecked.
+    const GATE_BATCH: usize = 25;
+    let mut fail_open_skipped = 0usize;
     for (ecosystem, bucket) in &buckets {
         if bucket.specs.is_empty() {
             continue;
         }
-        let response = match client
-            .gate(ecosystem.as_str(), &bucket.specs, &fail_on)
-            .await
-        {
-            Ok(r) => r,
-            Err(err) => {
-                if fail_open {
-                    eprintln!(
-                        "pkgradar: gate API call for {} failed ({err:#}); fail-open enabled, exiting 0. \
-                         Set `fail_open: false` in .pkgradar.yml or pass --no-fail-open to harden.",
-                        ecosystem.as_str()
-                    );
-                    return Ok(0);
-                } else {
-                    return Err(err);
+        for chunk in bucket.specs.chunks(GATE_BATCH) {
+            let response = match client.gate(ecosystem.as_str(), chunk, &fail_on).await {
+                Ok(r) => r,
+                Err(err) => {
+                    if fail_open {
+                        eprintln!(
+                            "pkgradar: gate API call for {} (batch of {}) failed ({err:#}); \
+                             fail-open enabled, skipping this batch. Other batches still gate. \
+                             Set `fail_open: false` in .pkgradar.yml or pass --no-fail-open to harden.",
+                            ecosystem.as_str(),
+                            chunk.len()
+                        );
+                        fail_open_skipped += chunk.len();
+                        continue;
+                    } else {
+                        return Err(err);
+                    }
                 }
+            };
+            if !response.allowed {
+                combined_allowed = false;
             }
-        };
-        if !response.allowed {
-            combined_allowed = false;
-        }
-        last_fail_on = response.fail_on.clone();
-        // Tag each report with its ecosystem if the server didn't (for
-        // older API versions that didn't echo the field back).
-        for mut r in response.reports {
-            if r.get("ecosystem").is_none() {
-                if let Some(obj) = r.as_object_mut() {
-                    obj.insert(
-                        "ecosystem".to_string(),
-                        Value::String(ecosystem.as_str().to_string()),
-                    );
+            last_fail_on = response.fail_on.clone();
+            // Tag each report with its ecosystem if the server didn't (for
+            // older API versions that didn't echo the field back).
+            for mut r in response.reports {
+                if r.get("ecosystem").is_none() {
+                    if let Some(obj) = r.as_object_mut() {
+                        obj.insert(
+                            "ecosystem".to_string(),
+                            Value::String(ecosystem.as_str().to_string()),
+                        );
+                    }
                 }
+                combined_reports.push(r);
             }
-            combined_reports.push(r);
+            combined_blocked.extend(response.blocked);
         }
-        combined_blocked.extend(response.blocked);
+    }
+    if fail_open_skipped > 0 && !args.common.quiet {
+        eprintln!(
+            "pkgradar: warning — {fail_open_skipped} spec(s) were not checked (fail-open); \
+             results below are partial."
+        );
     }
 
     let merged = GateResponse {
