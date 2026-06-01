@@ -114,6 +114,10 @@ pub async fn run(args: GateArgs) -> Result<i32> {
     // allowlisted specs, and finally bucket them per ecosystem.
     let mut seen: HashSet<(Ecosystem, String)> = HashSet::new();
     let mut buckets: BTreeMap<Ecosystem, EcosystemBucket> = BTreeMap::new();
+    // Count specs dropped as duplicates (same eco+name@version seen twice,
+    // typically overlap between two lockfiles) so the summary can report
+    // "N unique (M deduplicated)" instead of silently shrinking the count.
+    let mut duplicates = 0usize;
 
     let mut record = |eco: Ecosystem, spec: String| {
         if spec.is_empty() {
@@ -129,6 +133,8 @@ pub async fn run(args: GateArgs) -> Result<i32> {
         }
         if seen.insert((eco, spec.clone())) {
             bucket.specs.push(spec);
+        } else {
+            duplicates += 1;
         }
     };
 
@@ -209,7 +215,11 @@ pub async fn run(args: GateArgs) -> Result<i32> {
                 lockfiles_parsed += 1;
                 let n = entries.len();
                 if !args.common.quiet {
-                    eprintln!("pkgradar: {} — {} package(s)", path.display(), n);
+                    // stdout (not stderr) so the whole human narrative —
+                    // lockfile lines, summary, verdict — is one ordered
+                    // stream. Mixing stdout+stderr races under CI buffering
+                    // (verdict could print before the summary).
+                    println!("pkgradar: {} — {} package(s)", path.display(), n);
                 }
                 for entry in entries {
                     record(eco_from_lockfile(entry.ecosystem), entry.spec());
@@ -368,7 +378,13 @@ pub async fn run(args: GateArgs) -> Result<i32> {
 
     match args.common.format.as_str() {
         "json" => println!("{}", serde_json::to_string_pretty(&render_json(&merged))?),
-        _ => render_text(&merged, args.verbose, total_allowlisted, lockfiles_parsed),
+        _ => render_text(
+            &merged,
+            args.verbose,
+            total_allowlisted,
+            lockfiles_parsed,
+            duplicates,
+        ),
     }
 
     Ok(if merged.allowed { 0 } else { 1 })
@@ -423,7 +439,13 @@ fn report_to_decision(report: &Value) -> Value {
 /// Summary-first output: a header (counts, risk breakdown, advisories), then
 /// only the rows that carry signal (blocked / review / CVE-bearing), then a
 /// single unambiguous verdict line. `--verbose` adds a row for every package.
-fn render_text(response: &GateResponse, verbose: bool, allowlisted: usize, lockfiles: usize) {
+fn render_text(
+    response: &GateResponse,
+    verbose: bool,
+    allowlisted: usize,
+    lockfiles: usize,
+    duplicates: usize,
+) {
     let blocked_specs: HashSet<&str> = response.blocked.iter().map(|b| b.target.as_str()).collect();
 
     // --- tally ---
@@ -456,10 +478,17 @@ fn render_text(response: &GateResponse, verbose: bool, allowlisted: usize, lockf
         .map(|(e, n)| format!("{n} {e}"))
         .collect::<Vec<_>>()
         .join(", ");
-    if lockfiles > 0 {
-        println!("PkgRadar — {total} package(s) across {lockfiles} lockfile(s): {eco_str}");
+    let dedup_note = if duplicates > 0 {
+        format!(" ({total} unique; {duplicates} deduplicated across lockfiles)")
     } else {
-        println!("PkgRadar — {total} package(s): {eco_str}");
+        String::new()
+    };
+    if lockfiles > 0 {
+        println!(
+            "PkgRadar — {total} package(s) across {lockfiles} lockfile(s): {eco_str}{dedup_note}"
+        );
+    } else {
+        println!("PkgRadar — {total} package(s): {eco_str}{dedup_note}");
     }
     println!(
         "  risk: {high} high · {review} review · {low} low{}",
@@ -532,15 +561,16 @@ fn render_text(response: &GateResponse, verbose: bool, allowlisted: usize, lockf
         }
     }
 
-    // --- verdict: one unambiguous line stating the reason ---
-    eprintln!();
+    // --- verdict: one unambiguous line, on stdout so it always orders
+    // after the summary/rows (mixing with stderr races under CI buffering).
+    println!();
     if response.allowed {
-        eprintln!(
+        println!(
             "PkgRadar passed: 0 packages at or above `{fail_on}` ({total} scanned).",
             fail_on = response.fail_on,
         );
     } else {
-        eprintln!(
+        println!(
             "PkgRadar FAILED: {n} package(s) blocked at or above `{fail_on}` (of {total} scanned). \
              See BLOCK rows above.",
             n = response.blocked.len(),
