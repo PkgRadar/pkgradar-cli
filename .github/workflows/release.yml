@@ -14,7 +14,10 @@ name: release
 on:
   push:
     tags:
-      - 'v*'
+      # Full semver tags only (v1.2.3). The floating major tag `v1` — which
+      # the GitHub Action and our docs point at — must NOT trigger a release;
+      # it's just a moving pointer at the latest v1.x action.yml.
+      - 'v[0-9]+.[0-9]+.[0-9]+'
   workflow_dispatch:
 
 permissions:
