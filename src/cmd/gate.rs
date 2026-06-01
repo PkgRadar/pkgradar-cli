@@ -57,6 +57,12 @@ pub struct GateArgs {
     #[arg(long)]
     pub no_fail_open: bool,
 
+    /// Print a row for every package, including passes. Default output is
+    /// summary-first (counts + a clear verdict + only blocked/review/CVE
+    /// rows) to keep CI logs readable.
+    #[arg(long)]
+    pub verbose: bool,
+
     #[command(flatten)]
     pub common: CommonArgs,
 }
@@ -180,9 +186,11 @@ pub async fn run(args: GateArgs) -> Result<i32> {
 
     // Parse each lockfile and print its resolved path + spec count, so
     // coverage is explicit rather than deduced from a final tally.
+    let mut lockfiles_parsed = 0usize;
     for path in &lockfiles {
         match lockfile::parse(path) {
             Ok(entries) => {
+                lockfiles_parsed += 1;
                 let n = entries.len();
                 if !args.common.quiet {
                     eprintln!("pkgradar: {} — {} package(s)", path.display(), n);
@@ -319,10 +327,19 @@ pub async fn run(args: GateArgs) -> Result<i32> {
             combined_blocked.extend(response.blocked);
         }
     }
-    if fail_open_skipped > 0 && !args.common.quiet {
+    if fail_open_skipped > 0 {
+        // GitHub Actions surfaces `::warning::` lines in the run summary, so a
+        // partial (fail-open) result is impossible to miss — it won't hide
+        // behind a green check. This is the visibility the "gate runs
+        // fail-open" concern is really about.
+        println!(
+            "::warning::PkgRadar ran in fail-open mode: {fail_open_skipped} package(s) were NOT \
+             checked (API error/timeout) and were allowed. Set fail-open: false / --no-fail-open \
+             to fail the build on scanner errors instead."
+        );
         eprintln!(
-            "pkgradar: warning — {fail_open_skipped} spec(s) were not checked (fail-open); \
-             results below are partial."
+            "pkgradar: WARNING — {fail_open_skipped} package(s) not checked (fail-open); \
+             coverage is partial."
         );
     }
 
@@ -335,7 +352,7 @@ pub async fn run(args: GateArgs) -> Result<i32> {
 
     match args.common.format.as_str() {
         "json" => println!("{}", serde_json::to_string_pretty(&render_json(&merged))?),
-        _ => render_text(&merged, args.common.quiet, total_allowlisted),
+        _ => render_text(&merged, args.verbose, total_allowlisted, lockfiles_parsed),
     }
 
     Ok(if merged.allowed { 0 } else { 1 })
@@ -387,9 +404,66 @@ fn report_to_decision(report: &Value) -> Value {
     })
 }
 
-fn render_text(response: &GateResponse, quiet: bool, allowlisted: usize) {
+/// Summary-first output: a header (counts, risk breakdown, advisories), then
+/// only the rows that carry signal (blocked / review / CVE-bearing), then a
+/// single unambiguous verdict line. `--verbose` adds a row for every package.
+fn render_text(response: &GateResponse, verbose: bool, allowlisted: usize, lockfiles: usize) {
     let blocked_specs: HashSet<&str> = response.blocked.iter().map(|b| b.target.as_str()).collect();
 
+    // --- tally ---
+    let total = response.reports.len();
+    let (mut high, mut review, mut low, mut other) = (0usize, 0usize, 0usize, 0usize);
+    let (mut adv_pkgs, mut adv_total) = (0usize, 0usize);
+    let mut eco_counts: BTreeMap<&str, usize> = BTreeMap::new();
+    for r in &response.reports {
+        match r.get("risk").and_then(Value::as_str).unwrap_or("unknown") {
+            "high" | "vulnerable" => high += 1,
+            "review" => review += 1,
+            "low" => low += 1,
+            _ => other += 1,
+        }
+        if let Some(a) = r
+            .get("advisories")
+            .and_then(Value::as_array)
+            .filter(|a| !a.is_empty())
+        {
+            adv_pkgs += 1;
+            adv_total += a.len();
+        }
+        let eco = r.get("ecosystem").and_then(Value::as_str).unwrap_or("npm");
+        *eco_counts.entry(eco).or_insert(0) += 1;
+    }
+
+    // --- summary header ---
+    let eco_str = eco_counts
+        .iter()
+        .map(|(e, n)| format!("{n} {e}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    if lockfiles > 0 {
+        println!("PkgRadar — {total} package(s) across {lockfiles} lockfile(s): {eco_str}");
+    } else {
+        println!("PkgRadar — {total} package(s): {eco_str}");
+    }
+    println!(
+        "  risk: {high} high · {review} review · {low} low{}",
+        if other > 0 {
+            format!(" · {other} other")
+        } else {
+            String::new()
+        }
+    );
+    if adv_total > 0 {
+        println!(
+            "  advisories: {adv_total} known CVE(s) on {adv_pkgs} package(s) — informational, \
+             not blocking (use --fail-on-cve to gate on them)"
+        );
+    }
+    if allowlisted > 0 {
+        println!("  allowlisted: {allowlisted} skipped");
+    }
+
+    // --- detail rows: blocked + review + CVE-bearing always; all if verbose ---
     for report in &response.reports {
         let target = report
             .get("target")
@@ -405,24 +479,23 @@ fn render_text(response: &GateResponse, quiet: bool, allowlisted: usize) {
             .and_then(Value::as_str)
             .unwrap_or("npm");
         let is_blocked = blocked_specs.contains(target);
-        let mark = if is_blocked { "BLOCK" } else { "PASS " };
+        let advs = report
+            .get("advisories")
+            .and_then(Value::as_array)
+            .filter(|a| !a.is_empty());
 
-        if is_blocked || !quiet {
+        let show = is_blocked || verbose || risk == "review" || advs.is_some();
+        if show {
+            let mark = if is_blocked { "BLOCK" } else { "PASS " };
             println!("{mark} [{ecosystem:<4}] {target:<48} risk={risk:<7} score={score}");
         }
-
-        // Advisory-only CVEs: surface them as a non-blocking warning so a
-        // developer sees a known-vulnerable dependency even when the gate
-        // passes it. (If --fail-on-cve is set, the spec is already in the
-        // blocked list and printed below.)
         if !is_blocked {
-            let advs = report.get("advisories").and_then(Value::as_array);
-            if let Some(advs) = advs.filter(|a| !a.is_empty()) {
+            if let Some(advs) = advs {
                 let ids: Vec<&str> = advs
                     .iter()
                     .filter_map(|a| a.get("id").and_then(Value::as_str))
                     .collect();
-                let shown = ids.iter().take(5).cloned().collect::<Vec<_>>().join(", ");
+                let shown = ids.iter().take(5).copied().collect::<Vec<_>>().join(", ");
                 let extra = ids.len().saturating_sub(5);
                 let suffix = if extra > 0 {
                     format!(" (+{extra} more)")
@@ -443,24 +516,19 @@ fn render_text(response: &GateResponse, quiet: bool, allowlisted: usize) {
         }
     }
 
-    if !response.allowed {
-        eprintln!();
+    // --- verdict: one unambiguous line stating the reason ---
+    eprintln!();
+    if response.allowed {
         eprintln!(
-            "pkgradar: gate blocked {n} of {total} (fail_on={fail_on}).",
-            n = response.blocked.len(),
-            total = response.reports.len(),
+            "PkgRadar passed: 0 packages at or above `{fail_on}` ({total} scanned).",
             fail_on = response.fail_on,
         );
-    } else if !quiet {
-        eprintln!();
+    } else {
         eprintln!(
-            "pkgradar: {n} specs passed{extra}.",
-            n = response.reports.len(),
-            extra = if allowlisted > 0 {
-                format!(" ({allowlisted} skipped via allowlist)")
-            } else {
-                String::new()
-            },
+            "PkgRadar FAILED: {n} package(s) blocked at or above `{fail_on}` (of {total} scanned). \
+             See BLOCK rows above.",
+            n = response.blocked.len(),
+            fail_on = response.fail_on,
         );
     }
 }
