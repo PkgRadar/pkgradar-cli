@@ -144,9 +144,7 @@ fn render_text(reports: &[Value], quiet: bool) {
             .map(|a| a.len())
             .unwrap_or(0);
 
-        println!(
-            "[{ecosystem:<4}] {target}  risk={risk}  score={score}  findings={findings}"
-        );
+        println!("[{ecosystem:<4}] {target}  risk={risk}  score={score}  findings={findings}");
 
         if !quiet {
             if let Some(arr) = report.get("findings").and_then(Value::as_array) {

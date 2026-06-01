@@ -6,8 +6,8 @@ use std::path::PathBuf;
 
 use crate::client::{BlockedItem, Client, GateResponse};
 use crate::cmd::CommonArgs;
-use crate::lockfile::{self, Ecosystem};
 use crate::config;
+use crate::lockfile::{self, Ecosystem};
 
 #[derive(Args, Debug)]
 pub struct GateArgs {
@@ -102,12 +102,10 @@ pub async fn run(args: GateArgs) -> Result<i32> {
         if spec.is_empty() {
             return;
         }
-        let bucket = buckets
-            .entry(eco)
-            .or_insert_with(|| EcosystemBucket {
-                specs: Vec::new(),
-                allowlisted: HashSet::new(),
-            });
+        let bucket = buckets.entry(eco).or_insert_with(|| EcosystemBucket {
+            specs: Vec::new(),
+            allowlisted: HashSet::new(),
+        });
         if allow.contains(&spec) {
             bucket.allowlisted.insert(spec);
             return;
@@ -230,10 +228,7 @@ pub async fn run(args: GateArgs) -> Result<i32> {
     };
 
     match args.common.format.as_str() {
-        "json" => println!(
-            "{}",
-            serde_json::to_string_pretty(&render_json(&merged))?
-        ),
+        "json" => println!("{}", serde_json::to_string_pretty(&render_json(&merged))?),
         _ => render_text(&merged, args.common.quiet, total_allowlisted),
     }
 
@@ -307,9 +302,7 @@ fn render_text(response: &GateResponse, quiet: bool, allowlisted: usize) {
         let mark = if is_blocked { "BLOCK" } else { "PASS " };
 
         if is_blocked || !quiet {
-            println!(
-                "{mark} [{ecosystem:<4}] {target:<48} risk={risk:<7} score={score}"
-            );
+            println!("{mark} [{ecosystem:<4}] {target:<48} risk={risk:<7} score={score}");
         }
 
         // Advisory-only CVEs: surface them as a non-blocking warning so a
@@ -325,7 +318,11 @@ fn render_text(response: &GateResponse, quiet: bool, allowlisted: usize) {
                     .collect();
                 let shown = ids.iter().take(5).cloned().collect::<Vec<_>>().join(", ");
                 let extra = ids.len().saturating_sub(5);
-                let suffix = if extra > 0 { format!(" (+{extra} more)") } else { String::new() };
+                let suffix = if extra > 0 {
+                    format!(" (+{extra} more)")
+                } else {
+                    String::new()
+                };
                 println!(
                     "      \u{26a0} {n} known CVE advisory(ies) — not blocking: {shown}{suffix}",
                     n = advs.len()

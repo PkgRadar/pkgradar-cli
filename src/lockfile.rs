@@ -499,7 +499,10 @@ fn parse_requirements_line(line: &str) -> Option<LockfileEntry> {
     if version_part.contains(',') || version_part.contains(' ') {
         return None;
     }
-    let version = version_part.trim_matches('"').trim_matches('\'').to_string();
+    let version = version_part
+        .trim_matches('"')
+        .trim_matches('\'')
+        .to_string();
     Some(LockfileEntry {
         ecosystem: Ecosystem::Pypi,
         name,
