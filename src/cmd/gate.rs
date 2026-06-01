@@ -1,8 +1,8 @@
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use clap::Args;
 use serde_json::Value;
 use std::collections::{BTreeMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::client::{BlockedItem, Client, GateResponse};
 use crate::cmd::CommonArgs;
@@ -39,11 +39,13 @@ pub struct GateArgs {
     #[arg(long, value_parser = ["low", "moderate", "high", "critical"])]
     pub fail_on_cve: Option<String>,
 
-    /// Path to a lockfile to scan in addition to (or instead of) `<specs>`.
-    /// Auto-detects npm / pnpm / yarn-classic / pip / pipenv / poetry /
-    /// uv / pdm / Gemfile.lock by filename.
+    /// Path to a lockfile to gate. Repeatable — pass `--lockfile` multiple
+    /// times for a polyglot/monorepo (e.g. `--lockfile frontend/package-lock.json
+    /// --lockfile api/requirements.txt`). When omitted (and no positional
+    /// specs are given), PkgRadar RECURSIVELY DISCOVERS every supported
+    /// lockfile in the working tree and gates them all.
     #[arg(long)]
-    pub lockfile: Option<PathBuf>,
+    pub lockfile: Vec<PathBuf>,
 
     /// Path to a `.pkgradar.yml` config file. Defaults to `.pkgradar.yml`
     /// in the current directory if it exists.
@@ -137,20 +139,82 @@ pub async fn run(args: GateArgs) -> Result<i32> {
         };
         record(eco, spec);
     }
-    if let Some(path) = &args.lockfile {
-        for entry in lockfile::parse(path)? {
-            record(eco_from_lockfile(entry.ecosystem), entry.spec());
+    // Resolve which lockfiles to read:
+    //   - explicit `--lockfile` (one or more)  -> exactly those (a bad path
+    //     is a hard error; the user named it).
+    //   - else if positional specs were given  -> none (specs-only mode).
+    //   - else                                 -> recursively discover every
+    //     supported lockfile in the tree. This is what stops the silent
+    //     "green pass over a near-empty root lockfile" footgun: a polyglot
+    //     repo (frontend/package-lock.json + api/requirements.txt) is fully
+    //     covered without N hand-written steps.
+    let explicit_lockfiles = !args.lockfile.is_empty();
+    let specs_only = args
+        .specs
+        .iter()
+        .chain(cfg.watchlist.iter())
+        .next()
+        .is_some();
+    let discovery_mode = !explicit_lockfiles && !specs_only;
+
+    let lockfiles: Vec<PathBuf> = if explicit_lockfiles {
+        args.lockfile.clone()
+    } else if discovery_mode {
+        lockfile::discover(Path::new("."), 8)
+    } else {
+        Vec::new()
+    };
+
+    // Discovery that finds nothing is an ERROR, not a pass. A silent exit-0
+    // on zero coverage is indistinguishable from "your project is clean" —
+    // the exact failure mode that hid a polyglot repo's whole surface.
+    if discovery_mode && lockfiles.is_empty() {
+        return Err(anyhow!(
+            "no lockfile found in the working tree. Pass --lockfile <path> \
+             (repeatable), give explicit specs, or run from a directory \
+             containing a supported lockfile (package-lock.json, \
+             pnpm-lock.yaml, yarn.lock, requirements.txt, poetry.lock, \
+             uv.lock, Gemfile.lock, Cargo.lock, pom.xml, composer.lock, …)."
+        ));
+    }
+
+    // Parse each lockfile and print its resolved path + spec count, so
+    // coverage is explicit rather than deduced from a final tally.
+    for path in &lockfiles {
+        match lockfile::parse(path) {
+            Ok(entries) => {
+                let n = entries.len();
+                if !args.common.quiet {
+                    eprintln!("pkgradar: {} — {} package(s)", path.display(), n);
+                }
+                for entry in entries {
+                    record(eco_from_lockfile(entry.ecosystem), entry.spec());
+                }
+            }
+            Err(err) => {
+                if explicit_lockfiles {
+                    // The user named this file; refusing to parse it is a
+                    // hard error, not a silent skip.
+                    return Err(err.context(format!("lockfile {}", path.display())));
+                }
+                // Discovered (not user-named): a stray/unsupported file
+                // shouldn't fail the whole run — warn and move on.
+                eprintln!("pkgradar: skipping {} ({err:#})", path.display());
+            }
         }
     }
 
     let total_specs: usize = buckets.values().map(|b| b.specs.len()).sum();
     let total_allowlisted: usize = buckets.values().map(|b| b.allowlisted.len()).sum();
     if total_specs == 0 {
-        if !args.common.quiet {
-            eprintln!(
-                "pkgradar: nothing to gate (no specs provided and lockfile/allowlist filtered everything)."
-            );
-        }
+        // Reached only via explicit --lockfile / specs that resolved to
+        // nothing gateable (all entries filtered: git/file/workspace refs,
+        // etc.). Surface it loudly; discovery-found-nothing already errored.
+        eprintln!(
+            "pkgradar: nothing to gate — every entry was filtered (git/file/workspace \
+             refs or non-registry sources). Coverage is effectively zero; check the \
+             lockfile path(s) above."
+        );
         return Ok(0);
     }
 

@@ -17,7 +17,7 @@
 //! real lockfile.
 
 use anyhow::{anyhow, Context, Result};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Ecosystem {
@@ -236,6 +236,99 @@ fn detect_kind(path: &Path, content: &str) -> Result<LockfileKind> {
              pom.xml, packages.lock.json, packages.config, project.assets.json, \
              composer.lock."
         )),
+    }
+}
+
+// --- discovery -------------------------------------------------------------
+
+/// Lockfile filenames the parser recognises (lowercased). Mirrors the match
+/// in `detect_kind` — keep them in sync.
+const LOCKFILE_NAMES: &[&str] = &[
+    "package-lock.json",
+    "npm-shrinkwrap.json",
+    "pnpm-lock.yaml",
+    "pnpm-lock.yml",
+    "yarn.lock",
+    "requirements.txt",
+    "requirements.lock",
+    "constraints.txt",
+    "pipfile.lock",
+    "poetry.lock",
+    "uv.lock",
+    "pdm.lock",
+    "gemfile.lock",
+    "gems.locked",
+    "cargo.lock",
+    "pom.xml",
+    "packages.lock.json",
+    "packages.config",
+    "project.assets.json",
+    "composer.lock",
+];
+
+/// Directories never worth descending into when auto-discovering lockfiles:
+/// installed dependencies, build output, virtualenvs. A `package-lock.json`
+/// under `node_modules/` describes a dependency's OWN deps, not the
+/// project's — gating it would be noise. Hidden dirs (`.git`, `.venv`,
+/// `.next`, …) are skipped separately.
+const SKIP_DIRS: &[&str] = &[
+    "node_modules",
+    "vendor",
+    "bower_components",
+    "target",
+    "dist",
+    "build",
+    "out",
+    "venv",
+    "env",
+    "__pycache__",
+    "site-packages",
+];
+
+/// True if `name` is a lockfile the parser understands.
+pub fn is_lockfile_name(name: &str) -> bool {
+    LOCKFILE_NAMES.contains(&name.to_lowercase().as_str())
+}
+
+/// Recursively discover every supported lockfile under `root`, skipping
+/// dependency/build/VCS directories and capping recursion at `max_depth` so
+/// a pathological tree can't hang CI. Sorted for stable, legible output.
+///
+/// This is what makes a polyglot / monorepo "just work": a single gate step
+/// finds `frontend/package-lock.json` AND `api/requirements.txt` instead of
+/// silently scanning only whatever happens to sit at the repo root. The
+/// caller prints every path it gates, so coverage is explicit, not guessed.
+pub fn discover(root: &Path, max_depth: usize) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    discover_inner(root, max_depth, &mut found);
+    found.sort();
+    found.dedup();
+    found
+}
+
+fn discover_inner(dir: &Path, depth_left: usize, out: &mut Vec<PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if file_type.is_dir() {
+            if depth_left == 0 {
+                continue;
+            }
+            let name = entry.file_name().to_string_lossy().to_lowercase();
+            // Skip hidden dirs (.git/.venv/.next/...) and known noise dirs.
+            if name.starts_with('.') || SKIP_DIRS.contains(&name.as_str()) {
+                continue;
+            }
+            discover_inner(&entry.path(), depth_left - 1, out);
+        } else if let Some(name) = entry.file_name().to_str() {
+            if is_lockfile_name(name) {
+                out.push(entry.path());
+            }
+        }
     }
 }
 
@@ -1064,6 +1157,55 @@ fn parse_gemfile_lock(content: &str) -> Result<Vec<LockfileEntry>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn is_lockfile_name_matches_known_and_rejects_others() {
+        assert!(is_lockfile_name("package-lock.json"));
+        assert!(is_lockfile_name("Pipfile.lock")); // case-insensitive
+        assert!(is_lockfile_name("requirements.txt"));
+        assert!(!is_lockfile_name("package.json")); // manifest, not a lockfile
+        assert!(!is_lockfile_name("README.md"));
+    }
+
+    #[test]
+    fn discover_walks_nested_and_skips_noise() {
+        // Build a temp monorepo tree: nested lockfiles in subdirs, plus a
+        // lockfile buried in node_modules / a hidden dir that must be skipped.
+        let base = std::env::temp_dir().join(format!("pkgr_disc_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let mk = |rel: &str| {
+            let p = base.join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(&p, "{}").unwrap();
+        };
+        mk("package-lock.json"); // root (the "trivial" one)
+        mk("frontend/package-lock.json"); // real npm surface in a subdir
+        mk("api/requirements.txt"); // python service
+        mk("node_modules/dep/package-lock.json"); // MUST be skipped
+        mk(".git/package-lock.json"); // hidden dir, MUST be skipped
+        mk("frontend/node_modules/x/yarn.lock"); // nested noise, skipped
+
+        let found = discover(&base, 8);
+        let names: Vec<String> = found
+            .iter()
+            .map(|p| {
+                p.strip_prefix(&base)
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace('\\', "/")
+            })
+            .collect();
+        let _ = std::fs::remove_dir_all(&base);
+
+        assert!(names.contains(&"package-lock.json".to_string()));
+        assert!(names.contains(&"frontend/package-lock.json".to_string()));
+        assert!(names.contains(&"api/requirements.txt".to_string()));
+        assert_eq!(
+            found.len(),
+            3,
+            "node_modules/.git lockfiles must be skipped: {names:?}"
+        );
+    }
 
     #[test]
     fn npm_v2_parses() {
