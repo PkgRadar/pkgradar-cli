@@ -63,6 +63,15 @@ pub struct GateArgs {
     #[arg(long)]
     pub verbose: bool,
 
+    /// Exit 0 (with a loud notice) instead of erroring when discovery finds
+    /// NO supported lockfile. For blanket/group rollouts (e.g. a GitLab
+    /// `include:` across many repos) where some repos legitimately have no
+    /// dependencies to scan. Recursive discovery already finds nested
+    /// lockfiles, so this only triggers when there's genuinely nothing in a
+    /// supported ecosystem — and it's logged, not silent.
+    #[arg(long)]
+    pub allow_no_lockfile: bool,
+
     #[command(flatten)]
     pub common: CommonArgs,
 }
@@ -175,12 +184,19 @@ pub async fn run(args: GateArgs) -> Result<i32> {
     // on zero coverage is indistinguishable from "your project is clean" —
     // the exact failure mode that hid a polyglot repo's whole surface.
     if discovery_mode && lockfiles.is_empty() {
+        let msg = "no supported lockfile found in the working tree (searched recursively). \
+             Supported: package-lock.json, pnpm-lock.yaml, yarn.lock, requirements.txt, \
+             Pipfile.lock, poetry.lock, uv.lock, pdm.lock, Gemfile.lock, Cargo.lock, \
+             pom.xml, packages.lock.json, packages.config, project.assets.json, composer.lock.";
+        if args.allow_no_lockfile {
+            // Blanket-rollout escape hatch: nothing in a supported ecosystem
+            // to gate. Skip loudly (not a silent green) and pass.
+            eprintln!("pkgradar: {msg} Nothing to gate — skipping (--allow-no-lockfile).");
+            return Ok(0);
+        }
         return Err(anyhow!(
-            "no lockfile found in the working tree. Pass --lockfile <path> \
-             (repeatable), give explicit specs, or run from a directory \
-             containing a supported lockfile (package-lock.json, \
-             pnpm-lock.yaml, yarn.lock, requirements.txt, poetry.lock, \
-             uv.lock, Gemfile.lock, Cargo.lock, pom.xml, composer.lock, …)."
+            "{msg} Pass --lockfile <path> (repeatable), give explicit specs, or set \
+             --allow-no-lockfile to skip repos with no dependencies."
         ));
     }
 
