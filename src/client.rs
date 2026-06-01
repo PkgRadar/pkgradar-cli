@@ -63,12 +63,19 @@ impl Client {
         ecosystem: &str,
         specs: &[String],
         fail_on: &str,
+        fail_on_cve: Option<&str>,
     ) -> Result<GateResponse> {
-        let payload = serde_json::json!({
+        let mut payload = serde_json::json!({
             "specs": specs,
             "fail_on": fail_on,
             "ecosystem": ecosystem,
         });
+        // Only send fail_on_cve when set, so older servers that don't know
+        // the field aren't handed an unexpected value. Default behaviour
+        // (advisories are informational, never block) needs no field.
+        if let Some(sev) = fail_on_cve {
+            payload["fail_on_cve"] = serde_json::Value::String(sev.to_string());
+        }
         // Path includes the ecosystem so server logs + access logs are
         // legible without parsing the body. The body's `ecosystem`
         // field is the canonical source on the server side; the path

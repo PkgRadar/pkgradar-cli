@@ -31,6 +31,14 @@ pub struct GateArgs {
     #[arg(long, value_parser = ["high", "review", "low"])]
     pub fail_on: Option<String>,
 
+    /// Opt in to ALSO failing the build on known-vulnerability advisories
+    /// (plain CVEs) at or above this severity. Off by default — advisories
+    /// are shown as warnings but don't block, because a vulnerable-but-
+    /// legitimate dependency is not a supply-chain attack. Use this if you
+    /// want npm-audit-style CVE gating in the same step.
+    #[arg(long, value_parser = ["low", "moderate", "high", "critical"])]
+    pub fail_on_cve: Option<String>,
+
     /// Path to a lockfile to scan in addition to (or instead of) `<specs>`.
     /// Auto-detects npm / pnpm / yarn-classic / pip / pipenv / poetry /
     /// uv / pdm / Gemfile.lock by filename.
@@ -66,6 +74,10 @@ pub async fn run(args: GateArgs) -> Result<i32> {
         .clone()
         .or_else(|| cfg.fail_on.clone())
         .unwrap_or_else(|| "high".to_string());
+
+    // Off unless explicitly requested (flag or config). When unset, the
+    // server treats advisories as informational only.
+    let fail_on_cve = args.fail_on_cve.clone().or_else(|| cfg.fail_on_cve.clone());
 
     let timeout_ms = if args.common.timeout_ms != 60000 {
         args.common.timeout_ms
@@ -162,7 +174,10 @@ pub async fn run(args: GateArgs) -> Result<i32> {
             continue;
         }
         for chunk in bucket.specs.chunks(GATE_BATCH) {
-            let response = match client.gate(ecosystem.as_str(), chunk, &fail_on).await {
+            let response = match client
+                .gate(ecosystem.as_str(), chunk, &fail_on, fail_on_cve.as_deref())
+                .await
+            {
                 Ok(r) => r,
                 Err(err) => {
                     if fail_open {
@@ -295,6 +310,27 @@ fn render_text(response: &GateResponse, quiet: bool, allowlisted: usize) {
             println!(
                 "{mark} [{ecosystem:<4}] {target:<48} risk={risk:<7} score={score}"
             );
+        }
+
+        // Advisory-only CVEs: surface them as a non-blocking warning so a
+        // developer sees a known-vulnerable dependency even when the gate
+        // passes it. (If --fail-on-cve is set, the spec is already in the
+        // blocked list and printed below.)
+        if !is_blocked {
+            let advs = report.get("advisories").and_then(Value::as_array);
+            if let Some(advs) = advs.filter(|a| !a.is_empty()) {
+                let ids: Vec<&str> = advs
+                    .iter()
+                    .filter_map(|a| a.get("id").and_then(Value::as_str))
+                    .collect();
+                let shown = ids.iter().take(5).cloned().collect::<Vec<_>>().join(", ");
+                let extra = ids.len().saturating_sub(5);
+                let suffix = if extra > 0 { format!(" (+{extra} more)") } else { String::new() };
+                println!(
+                    "      \u{26a0} {n} known CVE advisory(ies) — not blocking: {shown}{suffix}",
+                    n = advs.len()
+                );
+            }
         }
     }
 

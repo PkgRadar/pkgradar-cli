@@ -14,6 +14,13 @@ pub struct RepoConfig {
     /// `--fail-on` flag; CLI argument wins when both are present.
     pub fail_on: Option<String>,
 
+    /// Opt in to also failing on known-vulnerability advisories (plain CVEs)
+    /// at or above this severity (low|moderate|high|critical). Mirrors the
+    /// CLI's `--fail-on-cve`; CLI argument wins. Off (advisory-only) when
+    /// absent.
+    #[serde(default)]
+    pub fail_on_cve: Option<String>,
+
     /// HTTP timeout per request, in milliseconds. CLI `--timeout-ms` wins.
     pub timeout_ms: Option<u64>,
 
