@@ -4,7 +4,7 @@ use serde_json::Value;
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 
-use crate::client::{BlockedItem, Client, GateResponse};
+use crate::client::{AuthRejected, BlockedItem, Client, GateResponse};
 use crate::cmd::CommonArgs;
 use crate::config;
 use crate::lockfile::{self, Ecosystem};
@@ -230,23 +230,65 @@ pub async fn run(args: GateArgs) -> Result<i32> {
     // previously tripped a 413 and — with fail-open — silently passed the
     // entire build unchecked.
     const GATE_BATCH: usize = 25;
+    // When a batch call fails (typically a cold cargo/maven batch exceeding
+    // the request timeout on a busy server), retry by HALVING it down to
+    // this size before fail-opening. A slow 25-batch becomes 12+13 — usually
+    // both succeed — so worst-case unchecked coverage drops from a whole
+    // batch to <=MIN. Without this, fail-open silently skips all 25 (a
+    // partial "green" that looks fully checked).
+    const MIN_RETRY_CHUNK: usize = 5;
+    // Bound total splits per run so a HARD outage (every call failing) fails
+    // open fast instead of fanning each batch into ~log2(N) doomed retries
+    // and making CI hang. Generous enough to rescue several slow batches.
+    let mut split_budget: i32 = 16;
     let mut fail_open_skipped = 0usize;
     for (ecosystem, bucket) in &buckets {
         if bucket.specs.is_empty() {
             continue;
         }
-        for chunk in bucket.specs.chunks(GATE_BATCH) {
+        // LIFO work queue: a failed large chunk is split and re-queued.
+        let mut queue: Vec<Vec<String>> =
+            bucket.specs.chunks(GATE_BATCH).map(<[_]>::to_vec).collect();
+        while let Some(chunk) = queue.pop() {
             let response = match client
-                .gate(ecosystem.as_str(), chunk, &fail_on, fail_on_cve.as_deref())
+                .gate(ecosystem.as_str(), &chunk, &fail_on, fail_on_cve.as_deref())
                 .await
             {
                 Ok(r) => r,
                 Err(err) => {
-                    if fail_open {
+                    // A rejected token is a config error, not a transient
+                    // outage — NEVER fail-open on it (that's how a wrong token
+                    // passes a build having scanned nothing). Abort the whole
+                    // gate loudly so the failure is impossible to miss.
+                    if err.downcast_ref::<AuthRejected>().is_some() {
+                        return Err(err.context(
+                            "gate aborted — API token rejected; NOTHING was scanned. \
+                             Fix PKGRADAR_TOKEN (re-copy from the dashboard; watch for a \
+                             stray newline). Not fail-opened: an invalid token is a \
+                             configuration error, not a transient outage.",
+                        ));
+                    }
+                    if chunk.len() > MIN_RETRY_CHUNK && split_budget > 0 {
+                        // Slow/large batch — retry smaller rather than skip.
+                        split_budget -= 1;
+                        let mid = chunk.len() / 2;
+                        if !args.common.quiet {
+                            eprintln!(
+                                "pkgradar: {} batch of {} failed ({err:#}); retrying as {}+{}.",
+                                ecosystem.as_str(),
+                                chunk.len(),
+                                mid,
+                                chunk.len() - mid
+                            );
+                        }
+                        queue.push(chunk[mid..].to_vec());
+                        queue.push(chunk[..mid].to_vec());
+                        continue;
+                    } else if fail_open {
                         eprintln!(
-                            "pkgradar: gate API call for {} (batch of {}) failed ({err:#}); \
-                             fail-open enabled, skipping this batch. Other batches still gate. \
-                             Set `fail_open: false` in .pkgradar.yml or pass --no-fail-open to harden.",
+                            "pkgradar: gate call for {} ({} spec(s)) failed ({err:#}); \
+                             fail-open enabled — these specs were NOT checked. Other batches \
+                             still gate. Set `fail_open: false` / --no-fail-open to fail instead.",
                             ecosystem.as_str(),
                             chunk.len()
                         );

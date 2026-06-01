@@ -7,6 +7,25 @@ use serde_json::Value;
 
 pub const DEFAULT_BASE_URL: &str = "https://pkgradar.com";
 
+/// The server rejected the API token (HTTP 401). This is a CONFIGURATION
+/// error, not a transient outage — so the gate must NOT fail-open on it.
+/// Silently passing a build whose token is wrong means zero coverage while
+/// the step shows green (the worst failure mode). Carried as a typed error
+/// so the gate loop can downcast and hard-fail regardless of `fail_open`.
+#[derive(Debug)]
+pub struct AuthRejected;
+
+impl std::fmt::Display for AuthRejected {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "authentication failed (401): the server rejected this API token"
+        )
+    }
+}
+
+impl std::error::Error for AuthRejected {}
+
 pub struct Client {
     inner: reqwest::Client,
     base_url: String,
@@ -41,9 +60,28 @@ pub struct ScanResponse {
 
 impl Client {
     pub fn new(base_url: String, token: String, timeout_ms: u64) -> Result<Self> {
+        // Tokens are routinely pasted into CI secret fields (or `--token`),
+        // which commonly append a trailing newline or stray spaces. Left in,
+        // that becomes part of the `Authorization: Bearer <token>\n` header
+        // value — which reqwest refuses to serialize ("failed to parse header
+        // value"). Every request then fails and, under fail-open, the build
+        // goes green having scanned NOTHING. Trim before anything else.
+        let token = token.trim().to_string();
         if token.is_empty() {
             return Err(anyhow!(
                 "no API token. Set PKGRADAR_TOKEN or pass --token. Issue one at https://pkgradar.com/dashboard/keys."
+            ));
+        }
+        // A token carrying bytes illegal in an HTTP header value (controls,
+        // embedded whitespace, non-ASCII) is a configuration error, not a
+        // transient outage. Fail loudly HERE rather than let every request
+        // die at header-build time and fail-open to a false green.
+        if token.bytes().any(|b| !(0x21..=0x7e).contains(&b)) {
+            return Err(anyhow!(
+                "API token contains characters that aren't valid in an HTTP header \
+                 (whitespace, control, or non-ASCII bytes). Re-copy the token from \
+                 https://pkgradar.com/dashboard/keys — a stray newline or space from \
+                 pasting into a CI secret is the usual cause."
             ));
         }
         let inner = reqwest::Client::builder()
@@ -93,9 +131,7 @@ impl Client {
 
         let status = response.status();
         if status == reqwest::StatusCode::UNAUTHORIZED {
-            return Err(anyhow!(
-                "authentication failed (401). Check PKGRADAR_TOKEN."
-            ));
+            return Err(anyhow::Error::new(AuthRejected));
         }
         if !(status.is_success() || status == reqwest::StatusCode::UNPROCESSABLE_ENTITY) {
             let body = response.text().await.unwrap_or_default();
@@ -106,6 +142,11 @@ impl Client {
             .await
             .with_context(|| format!("parsing /gate/{ecosystem} response"))?;
         Ok(body)
+    }
+
+    #[cfg(test)]
+    pub fn token_for_test(&self) -> &str {
+        &self.token
     }
 
     pub async fn scan(&self, ecosystem: &str, specs: &[String]) -> Result<ScanResponse> {
@@ -122,9 +163,7 @@ impl Client {
             .with_context(|| format!("POST {url}"))?;
         let status = response.status();
         if status == reqwest::StatusCode::UNAUTHORIZED {
-            return Err(anyhow!(
-                "authentication failed (401). Check PKGRADAR_TOKEN."
-            ));
+            return Err(anyhow::Error::new(AuthRejected));
         }
         if !status.is_success() {
             let body = response.text().await.unwrap_or_default();
@@ -135,5 +174,31 @@ impl Client {
             .await
             .with_context(|| format!("parsing /scan/{ecosystem} response"))?;
         Ok(body)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn token_with_trailing_newline_is_trimmed() {
+        // The exact bug: a token pasted into a CI secret with a trailing
+        // newline must be cleaned, not break header construction.
+        let c = Client::new("https://x".into(), "  pkr_abc123\n".into(), 1000).unwrap();
+        assert_eq!(c.token_for_test(), "pkr_abc123");
+    }
+
+    #[test]
+    fn whitespace_only_token_is_rejected() {
+        assert!(Client::new("https://x".into(), "\n   \t".into(), 1000).is_err());
+    }
+
+    #[test]
+    fn structurally_invalid_token_is_rejected_not_failed_open() {
+        // Internal space and non-ASCII can't go in a header — must error at
+        // construction (hard fail), never reach the fail-open path.
+        assert!(Client::new("https://x".into(), "pkr_ab cd".into(), 1000).is_err());
+        assert!(Client::new("https://x".into(), "pkr_\u{00e9}".into(), 1000).is_err());
     }
 }

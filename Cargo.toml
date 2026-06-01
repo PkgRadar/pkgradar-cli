@@ -1,6 +1,6 @@
 [package]
 name = "pkgradar"
-version = "0.10.0"
+version = "0.10.1"
 edition = "2021"
 description = "PkgRadar CI gate and static package scanner"
 license = "Apache-2.0"
