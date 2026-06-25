@@ -534,6 +534,31 @@ fn render_text(
             let mark = if is_blocked { "BLOCK" } else { "PASS " };
             println!("{mark} [{ecosystem:<4}] {target:<48} risk={risk:<7} score={score}");
         }
+        // Per-finding breakdown on blocked rows so a user can see WHY a package
+        // was blocked (to argue the verdict or justify a waiver). Highest-
+        // contribution findings first so the score reads as a sum.
+        if is_blocked {
+            if let Some(arr) = report.get("findings").and_then(Value::as_array) {
+                let mut fs: Vec<&Value> = arr.iter().collect();
+                fs.sort_by_key(|f| {
+                    std::cmp::Reverse(f.get("points").and_then(Value::as_u64).unwrap_or(0))
+                });
+                for f in fs.iter().take(6) {
+                    let kind = f.get("kind").and_then(Value::as_str).unwrap_or("?");
+                    let sev = f.get("severity").and_then(Value::as_str).unwrap_or("?");
+                    let pts = f.get("points").and_then(Value::as_u64).unwrap_or(0);
+                    let detail = f.get("detail").and_then(Value::as_str).unwrap_or("");
+                    if detail.is_empty() {
+                        println!("      [{sev}] {kind} (+{pts})");
+                    } else {
+                        println!("      [{sev}] {kind} (+{pts}): {detail}");
+                    }
+                }
+                if arr.len() > 6 {
+                    println!("      … {} more finding(s)", arr.len() - 6);
+                }
+            }
+        }
         if !is_blocked {
             if let Some(advs) = advs {
                 let ids: Vec<&str> = advs
@@ -552,12 +577,6 @@ fn render_text(
                     n = advs.len()
                 );
             }
-        }
-    }
-
-    for b in &response.blocked {
-        if let Some(summary) = b.summary.as_deref() {
-            println!("      {target}: {summary}", target = b.target);
         }
     }
 
