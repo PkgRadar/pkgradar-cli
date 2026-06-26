@@ -94,6 +94,13 @@ pkgradar-gate:
 
 `PKGRADAR_TOKEN` must be set in Settings → CI/CD → Variables.
 
+> **Heads-up — "Protect variable" is ON by default.** A protected GitLab variable
+> is only exposed on protected branches/tags, so a merge-request pipeline from an
+> ordinary feature branch sees an *empty* token and the gate fails with
+> "PKGRADAR_TOKEN is not set". When adding the variable, **un-check "Protect
+> variable"** (or protect the branches you run MRs from). This is the most common
+> first-run snag.
+
 ## Configure
 
 ```sh

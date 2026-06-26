@@ -69,7 +69,11 @@ impl Client {
         let token = token.trim().to_string();
         if token.is_empty() {
             return Err(anyhow!(
-                "no API token. Set PKGRADAR_TOKEN or pass --token. Issue one at https://pkgradar.com/dashboard/keys."
+                "no API token. Set PKGRADAR_TOKEN or pass --token. Issue one at \
+                 https://pkgradar.com/dashboard/keys.\n  On GitLab, an empty token \
+                 here usually means the CI variable is \"Protected\" but this pipeline \
+                 ran on a non-protected branch (e.g. a merge request) — un-protect the \
+                 variable or protect the branch."
             ));
         }
         // A token carrying bytes illegal in an HTTP header value (controls,
