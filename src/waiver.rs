@@ -111,9 +111,177 @@ pub fn split_target(target: &str) -> (&str, &str) {
     }
 }
 
+use crate::config::Waiver;
+
+/// A validated waiver: version req pre-compiled, expiry pre-parsed to a day
+/// number. Built once at gate startup; matching is then allocation-light.
+#[allow(dead_code)] // wired into gate.rs in the next task
+#[derive(Debug, Clone)]
+pub struct CompiledWaiver {
+    pub package: String,
+    pub req: Option<VersionReq>,
+    pub reason: String,
+    pub reviewer: Option<String>,
+    pub expires_day: Option<i64>,
+    pub expires_str: Option<String>,
+}
+
+#[allow(dead_code)] // wired into gate.rs in the next task
+impl CompiledWaiver {
+    /// Validate + compile. Err(message) on: empty package/reason, invalid semver
+    /// requirement, or unparseable `expires`.
+    pub fn compile(w: &Waiver) -> Result<CompiledWaiver, String> {
+        if w.package.trim().is_empty() {
+            return Err("waiver `package` is empty".to_string());
+        }
+        if w.reason.trim().is_empty() {
+            return Err(format!(
+                "waiver for \"{}\" has an empty `reason`",
+                w.package
+            ));
+        }
+        let req = match &w.versions {
+            Some(s) => Some(
+                VersionReq::parse(s)
+                    .map_err(|e| format!("waiver for \"{}\": bad `versions` ({e})", w.package))?,
+            ),
+            None => None,
+        };
+        let expires_day = match &w.expires {
+            Some(s) => {
+                let (y, m, d) = parse_ymd(s).ok_or_else(|| {
+                    format!("waiver for \"{}\": `expires` must be YYYY-MM-DD", w.package)
+                })?;
+                Some(days_from_civil(y, m, d))
+            }
+            None => None,
+        };
+        Ok(CompiledWaiver {
+            package: w.package.clone(),
+            req,
+            reason: w.reason.clone(),
+            reviewer: w.reviewer.clone(),
+            expires_day,
+            expires_str: w.expires.clone(),
+        })
+    }
+}
+
+/// What happened when matching one blocked item against the waiver set.
+#[allow(dead_code)] // wired into gate.rs in the next task
+#[derive(Debug, PartialEq, Eq)]
+pub enum WaiverOutcome {
+    Applied(usize),
+    Expired(usize),
+    NoMatch,
+}
+
+/// Decide a single (name, version). First non-expired match wins; if the only
+/// matches are expired, report the first expired one so the caller can warn.
+#[allow(dead_code)] // wired into gate.rs in the next task
+pub fn decide(name: &str, version: &str, waivers: &[CompiledWaiver], today: i64) -> WaiverOutcome {
+    let mut first_expired: Option<usize> = None;
+    for (i, w) in waivers.iter().enumerate() {
+        if !name_glob_matches(&w.package, name) {
+            continue;
+        }
+        let version_ok = match &w.req {
+            Some(req) => version_matches(req, version),
+            None => true,
+        };
+        if !version_ok {
+            continue;
+        }
+        match w.expires_day {
+            Some(e) if is_expired(e, today) => {
+                if first_expired.is_none() {
+                    first_expired = Some(i);
+                }
+            }
+            _ => return WaiverOutcome::Applied(i),
+        }
+    }
+    match first_expired {
+        Some(i) => WaiverOutcome::Expired(i),
+        None => WaiverOutcome::NoMatch,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn cw(pkg: &str, ver: Option<&str>, expires: Option<&str>) -> CompiledWaiver {
+        CompiledWaiver::compile(&crate::config::Waiver {
+            package: pkg.to_string(),
+            versions: ver.map(String::from),
+            reason: "r".to_string(),
+            reviewer: None,
+            expires: expires.map(String::from),
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn compile_rejects_bad_input() {
+        use crate::config::Waiver;
+        let bad_pkg = Waiver {
+            package: "".into(),
+            reason: "r".into(),
+            ..Default::default()
+        };
+        assert!(CompiledWaiver::compile(&bad_pkg).is_err());
+        let bad_reason = Waiver {
+            package: "x".into(),
+            reason: "".into(),
+            ..Default::default()
+        };
+        assert!(CompiledWaiver::compile(&bad_reason).is_err());
+        let bad_ver = Waiver {
+            package: "x".into(),
+            reason: "r".into(),
+            versions: Some("not-a-req!!".into()),
+            ..Default::default()
+        };
+        assert!(CompiledWaiver::compile(&bad_ver).is_err());
+        let bad_date = Waiver {
+            package: "x".into(),
+            reason: "r".into(),
+            expires: Some("2026-99-99".into()),
+            ..Default::default()
+        };
+        assert!(CompiledWaiver::compile(&bad_date).is_err());
+    }
+
+    #[test]
+    fn decide_outcomes() {
+        let today = days_from_civil(2026, 6, 26);
+        let ws = vec![
+            cw("sharp", Some(">=0.33.0, <0.34.0"), Some("2026-12-31")),
+            cw("left-pad", None, None),
+            cw("oldwaiver", None, Some("2026-01-01")),
+        ];
+        assert!(matches!(
+            decide("sharp", "0.33.5", &ws, today),
+            WaiverOutcome::Applied(0)
+        ));
+        assert!(matches!(
+            decide("sharp", "0.34.0", &ws, today),
+            WaiverOutcome::NoMatch
+        ));
+        assert!(matches!(
+            decide("left-pad", "9.9.9", &ws, today),
+            WaiverOutcome::Applied(1)
+        ));
+        assert!(matches!(
+            decide("oldwaiver", "1.0.0", &ws, today),
+            WaiverOutcome::Expired(2)
+        ));
+        assert!(matches!(
+            decide("unrelated", "1.0.0", &ws, today),
+            WaiverOutcome::NoMatch
+        ));
+    }
 
     #[test]
     fn name_glob() {
