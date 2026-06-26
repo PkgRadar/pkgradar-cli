@@ -30,6 +30,7 @@ case "$OS-$ARCH" in
   linux-aarch64)  ASSET="pkgradar-aarch64-unknown-linux-gnu.tar.gz" ;;
   darwin-x86_64)  ASSET="pkgradar-x86_64-apple-darwin.tar.gz" ;;
   darwin-arm64)   ASSET="pkgradar-aarch64-apple-darwin.tar.gz" ;;
+  *) echo "unsupported platform: $OS-$ARCH (use 'cargo install pkgradar')" >&2; exit 1 ;;
 esac
 curl -sSfL "https://github.com/PkgRadar/pkgradar-cli/releases/download/${TAG}/${ASSET}" \
   | tar -xz
@@ -68,6 +69,7 @@ directly without specifying a subpath:
 | `token`     | yes      | —       | API token from <https://pkgradar.com/dashboard/keys>                                                          |
 | `lockfile`  | no       | auto    | Path to a lockfile. Auto-detects npm/pnpm/yarn-classic, pip/pipenv/poetry/uv/pdm in the working dir.          |
 | `fail-on`   | no       | `high`  | Block on this risk level or worse (`low`, `review`, `high`)                                                   |
+| `fail-on-cve` | no     | —       | Also block on known-vulnerability advisories (plain CVEs) at or above this severity (`low`, `moderate`, `high`, `critical`). Off by default. |
 | `config`    | no       | —       | Path to a `.pkgradar.yml` config file                                                                         |
 | `fail-open` | no       | `true`  | Exit 0 on transport-level API errors (timeout, 5xx). Set `false` to harden.                                   |
 | `version`   | no       | latest  | Pin a specific `pkgradar` CLI version, e.g. `v0.1.0`                                                          |
@@ -112,6 +114,10 @@ Or commit a `.pkgradar.yml` at the root of your repo:
 
 ```yaml
 fail_on: high
+# Optional: also fail on known CVE advisories at or above this severity.
+# Off by default (advisories are shown as warnings, not blocking).
+# One of: low | moderate | high | critical.
+fail_on_cve: high
 timeout_ms: 30000
 fail_open: true
 allowlist:
@@ -156,6 +162,17 @@ transitive in one call.
 ```sh
 pkgradar gate lodash@4.17.21 left-pad@1.3.0 --fail-on high
 pkgradar gate --lockfile pnpm-lock.yaml --fail-on review
+```
+
+By default `--fail-on` gates on PkgRadar's supply-chain risk verdict only;
+known-vulnerability advisories (plain CVEs) are shown as informational
+warnings and don't block. Add `--fail-on-cve <severity>` (or set
+`fail_on_cve:` in `.pkgradar.yml`) to ALSO fail the build on advisories at
+or above that severity (`low`, `moderate`, `high`, `critical`) — npm-audit-
+style CVE gating in the same step:
+
+```sh
+pkgradar gate --lockfile package-lock.json --fail-on high --fail-on-cve high
 ```
 
 #### Merge-request (diff) mode
@@ -286,8 +303,14 @@ cargo build --release
 cargo test --release
 ```
 
-The binary is statically linked against `rustls-tls-native-roots`, so it
-picks up the host's CA bundle and doesn't link OpenSSL at runtime.
+TLS uses `rustls-tls-native-roots`, so the binary picks up the host's CA
+bundle and doesn't link OpenSSL at runtime.
+
+The prebuilt binary is **dynamically linked against glibc** (the release
+matrix builds `*-unknown-linux-gnu`); there is no musl build yet. On
+Alpine/musl images the prebuilt binary fails to exec (`exec: not found`,
+exit 127) — use a glibc-based image (e.g. `debian:bookworm-slim`) or
+`cargo install pkgradar` to build from source against the local libc.
 
 ## License
 

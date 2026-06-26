@@ -366,6 +366,13 @@ pub async fn run(args: GateArgs) -> Result<i32> {
     // and making CI hang. Generous enough to rescue several slow batches.
     let mut split_budget: i32 = 16;
     let mut fail_open_skipped = 0usize;
+    // Accumulate the server's quota-exhausted fail-open signal across batches:
+    // the per-batch counts sum, and we keep the first notice seen (they're all
+    // the same templated string). The merged result carries this so the
+    // renderer can warn — otherwise a green gate that scanned NOTHING new
+    // (every new dep skipped on quota) goes by silently.
+    let mut combined_quota_exhausted: u64 = 0;
+    let mut combined_notice: Option<String> = None;
     for (ecosystem, bucket) in &buckets {
         if bucket.specs.is_empty() {
             continue;
@@ -427,6 +434,10 @@ pub async fn run(args: GateArgs) -> Result<i32> {
                 combined_allowed = false;
             }
             last_fail_on = response.fail_on.clone();
+            combined_quota_exhausted += response.quota_exhausted.unwrap_or(0);
+            if combined_notice.is_none() {
+                combined_notice = response.notice.clone();
+            }
             // Tag each report with its ecosystem if the server didn't (for
             // older API versions that didn't echo the field back).
             for mut r in response.reports {
@@ -496,6 +507,12 @@ pub async fn run(args: GateArgs) -> Result<i32> {
         fail_on: last_fail_on,
         blocked: combined_blocked,
         reports: combined_reports,
+        quota_exhausted: if combined_quota_exhausted > 0 {
+            Some(combined_quota_exhausted)
+        } else {
+            None
+        },
+        notice: combined_notice,
     };
 
     match args.common.format.as_str() {
@@ -542,6 +559,12 @@ fn render_json(response: &GateResponse, waived: &[WaivedItem]) -> Value {
         "blocked": response.blocked.iter().map(blocked_to_json).collect::<Vec<_>>(),
         "waived": waived.iter().map(waived_to_json).collect::<Vec<_>>(),
         "decisions": response.reports.iter().map(report_to_decision).collect::<Vec<_>>(),
+        // Surface the coverage gap in machine-readable output too, so a JSON
+        // consumer (a CI step parsing the result) sees the quota fail-open
+        // rather than just a green `allowed: true`.
+        "quota_exhausted": response.quota_exhausted.unwrap_or(0),
+        "unscanned": unscanned_report_count(response),
+        "notice": response.notice,
     })
 }
 
@@ -635,6 +658,60 @@ pub fn apply_waivers(
         }
     }
     (still, waived, expired)
+}
+
+/// Count reports the server couldn't actually scan: `risk:"unscanned"`
+/// (quota exhausted, fail-open) or `risk:"error"` (scanner failure). These
+/// are the silent-green cases — the gate is GREEN but coverage is partial.
+fn unscanned_report_count(response: &GateResponse) -> usize {
+    response
+        .reports
+        .iter()
+        .filter(|r| {
+            matches!(
+                r.get("risk").and_then(Value::as_str),
+                Some("unscanned") | Some("error")
+            )
+        })
+        .count()
+}
+
+/// Whether the gate result has any "scanned nothing" coverage gap that must be
+/// surfaced LOUDLY even though the gate may be green: the server reported a
+/// quota-exhausted count, or any report came back unscanned/errored.
+fn has_coverage_gap(response: &GateResponse) -> bool {
+    response.quota_exhausted.unwrap_or(0) > 0 || unscanned_report_count(response) > 0
+}
+
+/// Emit the LOUD quota/scanner coverage-gap warning, mirroring the fail-open
+/// warning style: a GitHub `::warning::` line on stdout and a `pkgradar:
+/// WARNING …` line on stderr, plus the server `notice` verbatim if present.
+/// Returns true if it printed (i.e. there was a gap), so the caller can branch.
+fn warn_coverage_gap(response: &GateResponse) -> bool {
+    if !has_coverage_gap(response) {
+        return false;
+    }
+    // Prefer the server's authoritative quota count; fall back to the number of
+    // unscanned/errored reports so a pure scanner-error gap is still counted.
+    let n = response
+        .quota_exhausted
+        .unwrap_or(0)
+        .max(unscanned_report_count(response) as u64);
+    println!(
+        "::warning::PkgRadar scanned NOTHING new for {n} package(s) (scan quota exhausted / \
+         scanner error): the gate is GREEN but coverage is PARTIAL. Upgrade your plan or wait \
+         for the quota reset to gate these."
+    );
+    eprintln!(
+        "pkgradar: WARNING — {n} package(s) NOT scanned (quota exhausted / scanner error); \
+         coverage is partial. Upgrade your plan or wait for quota reset."
+    );
+    if let Some(notice) = response.notice.as_deref() {
+        if !notice.is_empty() {
+            eprintln!("pkgradar: {notice}");
+        }
+    }
+    true
 }
 
 /// Summary-first output: a header (counts, risk breakdown, advisories), then
@@ -737,9 +814,18 @@ fn render_text(
             .and_then(Value::as_array)
             .filter(|a| !a.is_empty());
 
-        let show = is_blocked || verbose || risk == "review" || advs.is_some();
+        // Always surface unscanned/errored rows: they're the "scanned nothing"
+        // coverage gap and must never hide behind the green summary.
+        let unscanned = risk == "unscanned" || risk == "error";
+        let show = is_blocked || verbose || risk == "review" || advs.is_some() || unscanned;
         if show {
-            let mark = if is_blocked { "BLOCK" } else { "PASS " };
+            let mark = if is_blocked {
+                "BLOCK"
+            } else if unscanned {
+                "SKIP "
+            } else {
+                "PASS "
+            };
             println!("{mark} [{ecosystem:<4}] {target:<48} risk={risk:<7} score={score}");
         }
         // Per-finding breakdown on blocked rows so a user can see WHY a package
@@ -803,6 +889,11 @@ fn render_text(
         println!("WAIVE [{:<4}] {:<48} {meta}", w.eco, w.item.target);
     }
 
+    // --- coverage-gap warning: quota exhausted / scanner error means the gate
+    // may be GREEN having scanned NOTHING new. Surface it loudly (GitHub
+    // ::warning:: + stderr) so a partial result can't hide behind a pass.
+    warn_coverage_gap(response);
+
     // --- verdict: one unambiguous line, on stdout so it always orders
     // after the summary/rows (mixing with stderr races under CI buffering).
     println!();
@@ -845,6 +936,55 @@ mod tests {
             expires: expires.map(String::from),
         })
         .unwrap()
+    }
+
+    fn empty_response() -> GateResponse {
+        GateResponse {
+            allowed: true,
+            fail_on: "high".to_string(),
+            blocked: Vec::new(),
+            reports: Vec::new(),
+            quota_exhausted: None,
+            notice: None,
+        }
+    }
+
+    #[test]
+    fn quota_exhausted_count_triggers_coverage_gap() {
+        // The P0: a GREEN gate (allowed: true) that scanned NOTHING new must
+        // be flagged. quota_exhausted alone — with no reports — is enough.
+        let mut r = empty_response();
+        r.quota_exhausted = Some(3);
+        r.notice = Some("3 new dependency(ies) were not scanned".to_string());
+        assert!(has_coverage_gap(&r));
+        assert_eq!(unscanned_report_count(&r), 0);
+
+        let json = render_json(&r, &[]);
+        assert_eq!(json["allowed"], true);
+        assert_eq!(json["quota_exhausted"], 3);
+        assert_eq!(json["notice"], "3 new dependency(ies) were not scanned");
+    }
+
+    #[test]
+    fn unscanned_report_triggers_coverage_gap_and_is_counted() {
+        // Even without a quota count, an `unscanned`/`error` report is a gap.
+        let mut r = empty_response();
+        r.reports = vec![
+            serde_json::json!({ "target": "evil@1.0.0", "risk": "unscanned" }),
+            serde_json::json!({ "target": "boom@2.0.0", "risk": "error" }),
+            serde_json::json!({ "target": "fine@3.0.0", "risk": "low" }),
+        ];
+        assert!(has_coverage_gap(&r));
+        assert_eq!(unscanned_report_count(&r), 2);
+        assert_eq!(render_json(&r, &[])["unscanned"], 2);
+    }
+
+    #[test]
+    fn clean_response_has_no_coverage_gap() {
+        let mut r = empty_response();
+        r.reports = vec![serde_json::json!({ "target": "fine@3.0.0", "risk": "low" })];
+        assert!(!has_coverage_gap(&r));
+        assert_eq!(render_json(&r, &[])["quota_exhausted"], 0);
     }
 
     #[test]

@@ -28,6 +28,13 @@ inputs:
     description: Block when a spec's risk is at or above this level (low | review | high).
     required: false
     default: high
+  fail-on-cve:
+    description: >-
+      Also block on known-vulnerability advisories (plain CVEs) at or above this
+      severity (low | moderate | high | critical). Off by default — advisories are
+      shown as warnings but don't block. Leave UNSET to keep them informational.
+    required: false
+    default: ""
   config:
     description: Path to a .pkgradar.yml config file (default `.pkgradar.yml`).
     required: false
@@ -132,6 +139,7 @@ runs:
         PKGRADAR_TOKEN: ${{ inputs.token }}
         INPUT_LOCKFILE: ${{ inputs.lockfile }}
         INPUT_FAIL_ON: ${{ inputs.fail-on }}
+        INPUT_FAIL_ON_CVE: ${{ inputs.fail-on-cve }}
         INPUT_CONFIG: ${{ inputs.config }}
         INPUT_BASE_URL: ${{ inputs.base-url }}
         INPUT_FAIL_OPEN: ${{ inputs.fail-open }}
@@ -141,6 +149,11 @@ runs:
       run: |
         set -euo pipefail
         ARGS=(--fail-on "$INPUT_FAIL_ON")
+        # Opt-in CVE gating: only pass --fail-on-cve when the input is set, so
+        # the default (advisories informational, never blocking) is preserved.
+        if [ -n "$INPUT_FAIL_ON_CVE" ]; then
+          ARGS+=(--fail-on-cve "$INPUT_FAIL_ON_CVE")
+        fi
         # Explicit lockfile path(s): space/newline-separated -> one --lockfile
         # each. When unset, pkgradar recursively discovers all lockfiles and
         # errors if none are found (no more silent green pass over an empty

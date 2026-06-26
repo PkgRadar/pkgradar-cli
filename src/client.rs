@@ -40,6 +40,17 @@ pub struct GateResponse {
     pub blocked: Vec<BlockedItem>,
     #[serde(default)]
     pub reports: Vec<Value>,
+    /// Count of NEW dependencies the server could NOT scan because the
+    /// account's monthly scan quota is exhausted. The server fails OPEN here
+    /// (allowed stays true, these reports get `risk: "unscanned"`), so without
+    /// surfacing this the customer gets a green gate that scanned nothing new.
+    /// Top-level `quota_exhausted` JSON key on the gate response.
+    #[serde(default)]
+    pub quota_exhausted: Option<u64>,
+    /// Human-readable explanation the server attaches alongside
+    /// `quota_exhausted` (top-level `notice` JSON key). Surfaced verbatim.
+    #[serde(default)]
+    pub notice: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
