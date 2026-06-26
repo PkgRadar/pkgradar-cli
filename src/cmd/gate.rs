@@ -214,11 +214,16 @@ pub async fn run(args: GateArgs) -> Result<i32> {
 
     // Diff mode: only gate entries new vs a baseline git ref (MR pipelines).
     // Resolve the ref ONCE; an unresolvable ref degrades to absolute mode so we
-    // never silently skip scanning.
+    // never silently skip scanning. Resolve from the first lockfile's directory
+    // (where baseline_entries also runs git) so a nested/explicit-lockfile repo
+    // isn't falsely reported unresolvable; fall back to the CWD.
+    let git_cwd = lockfiles
+        .first()
+        .and_then(|p| p.parent())
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| std::path::Path::new("."));
     let diff_ref: Option<String> = match args.baseline.as_deref() {
-        Some(r) if crate::baseline::ref_is_resolvable_in(std::path::Path::new("."), r) => {
-            Some(r.to_string())
-        }
+        Some(r) if crate::baseline::ref_is_resolvable_in(git_cwd, r) => Some(r.to_string()),
         Some(r) => {
             eprintln!(
                 "pkgradar: --baseline {r} could not be resolved (git missing or ref not \
@@ -297,14 +302,25 @@ pub async fn run(args: GateArgs) -> Result<i32> {
     let total_specs: usize = buckets.values().map(|b| b.specs.len()).sum();
     let total_allowlisted: usize = buckets.values().map(|b| b.allowlisted.len()).sum();
     if total_specs == 0 {
-        // Reached only via explicit --lockfile / specs that resolved to
-        // nothing gateable (all entries filtered: git/file/workspace refs,
-        // etc.). Surface it loudly; discovery-found-nothing already errored.
-        eprintln!(
-            "pkgradar: nothing to gate — every entry was filtered (git/file/workspace \
-             refs or non-registry sources). Coverage is effectively zero; check the \
-             lockfile path(s) above."
-        );
+        if diff_ref.is_some() {
+            // Diff mode with zero new specs = a clean MR that adds/bumps no
+            // dependencies. That's the success case, not a filtering failure.
+            if !args.common.quiet {
+                println!(
+                    "pkgradar: diff mode — no new or version-bumped dependencies vs \
+                     baseline. Nothing to gate."
+                );
+            }
+        } else {
+            // Reached only via explicit --lockfile / specs that resolved to
+            // nothing gateable (all entries filtered: git/file/workspace refs,
+            // etc.). Surface it loudly; discovery-found-nothing already errored.
+            eprintln!(
+                "pkgradar: nothing to gate — every entry was filtered (git/file/workspace \
+                 refs or non-registry sources). Coverage is effectively zero; check the \
+                 lockfile path(s) above."
+            );
+        }
         return Ok(0);
     }
 
