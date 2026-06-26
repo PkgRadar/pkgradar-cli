@@ -490,8 +490,6 @@ pub async fn run(args: GateArgs) -> Result<i32> {
         }
         waived = waived_items;
     }
-    let _ = &waived;
-
     let merged = GateResponse {
         allowed: combined_allowed,
         fail_on: last_fail_on,
@@ -500,9 +498,13 @@ pub async fn run(args: GateArgs) -> Result<i32> {
     };
 
     match args.common.format.as_str() {
-        "json" => println!("{}", serde_json::to_string_pretty(&render_json(&merged))?),
+        "json" => println!(
+            "{}",
+            serde_json::to_string_pretty(&render_json(&merged, &waived))?
+        ),
         _ => render_text(
             &merged,
+            &waived,
             args.verbose,
             total_allowlisted,
             lockfiles_parsed,
@@ -532,12 +534,25 @@ fn classify_cli_spec(raw: &str) -> (Ecosystem, String) {
     }
 }
 
-fn render_json(response: &GateResponse) -> Value {
+fn render_json(response: &GateResponse, waived: &[WaivedItem]) -> Value {
     serde_json::json!({
         "allowed": response.allowed,
         "fail_on": response.fail_on,
         "blocked": response.blocked.iter().map(blocked_to_json).collect::<Vec<_>>(),
+        "waived": waived.iter().map(waived_to_json).collect::<Vec<_>>(),
         "decisions": response.reports.iter().map(report_to_decision).collect::<Vec<_>>(),
+    })
+}
+
+fn waived_to_json(w: &WaivedItem) -> Value {
+    serde_json::json!({
+        "target": w.item.target,
+        "ecosystem": w.eco,
+        "risk": w.item.risk,
+        "score": w.item.score,
+        "reason": w.reason,
+        "reviewer": w.reviewer,
+        "expires": w.expires,
     })
 }
 
@@ -561,7 +576,6 @@ fn report_to_decision(report: &Value) -> Value {
 
 /// A blocked item that a waiver downgraded — still scanned + reported, not
 /// failing. Carries the resolved ecosystem + the waiver's metadata for output.
-#[allow(dead_code)] // fields rendered by the waived-output task (next)
 pub struct WaivedItem {
     pub item: crate::client::BlockedItem,
     pub eco: String,
@@ -627,6 +641,7 @@ pub fn apply_waivers(
 /// single unambiguous verdict line. `--verbose` adds a row for every package.
 fn render_text(
     response: &GateResponse,
+    waived: &[WaivedItem],
     verbose: bool,
     allowlisted: usize,
     lockfiles: usize,
@@ -692,6 +707,12 @@ fn render_text(
     }
     if allowlisted > 0 {
         println!("  allowlisted: {allowlisted} skipped");
+    }
+    if !waived.is_empty() {
+        println!(
+            "  waived: {} (reviewed — reported, not failing)",
+            waived.len()
+        );
     }
 
     // --- detail rows: blocked + review + CVE-bearing always; all if verbose ---
@@ -766,6 +787,21 @@ fn render_text(
         }
     }
 
+    // --- waived rows: still-scanned items that matched a waiver ---
+    for w in waived {
+        let mut meta = w.reason.clone();
+        if let Some(r) = &w.reviewer {
+            meta.push_str(&format!(" ({r}"));
+            if let Some(e) = &w.expires {
+                meta.push_str(&format!(", expires {e}"));
+            }
+            meta.push(')');
+        } else if let Some(e) = &w.expires {
+            meta.push_str(&format!(" (expires {e})"));
+        }
+        println!("WAIVE [{:<4}] {:<48} {meta}", w.eco, w.item.target);
+    }
+
     // --- verdict: one unambiguous line, on stdout so it always orders
     // after the summary/rows (mixing with stderr races under CI buffering).
     println!();
@@ -808,6 +844,22 @@ mod tests {
             expires: expires.map(String::from),
         })
         .unwrap()
+    }
+
+    #[test]
+    fn waived_to_json_shape() {
+        let w = WaivedItem {
+            item: bi("sharp@0.33.5"),
+            eco: "npm".to_string(),
+            reason: "reviewed".to_string(),
+            reviewer: Some("a@b".to_string()),
+            expires: Some("2026-12-31".to_string()),
+        };
+        let v = waived_to_json(&w);
+        assert_eq!(v["target"], "sharp@0.33.5");
+        assert_eq!(v["ecosystem"], "npm");
+        assert_eq!(v["reason"], "reviewed");
+        assert_eq!(v["expires"], "2026-12-31");
     }
 
     #[test]
