@@ -122,6 +122,29 @@ watchlist:
 
 CLI flags override the config file on conflict.
 
+### Waivers — downgrade a reviewed false positive
+
+`allowlist` bypasses a spec entirely (it's never scanned). A **waiver** is the
+auditable alternative: the package is still scanned and reported, but a matched
+finding is moved out of the FAIL set instead of blocking the build. Waivers match
+by name glob + optional semver range and carry a reason, optional reviewer, and
+optional expiry.
+
+```yaml
+waivers:
+  - package: "sharp"                 # name glob (* wildcard) — required
+    versions: ">=0.33.0, <0.34.0"    # semver range — optional (omit = all versions)
+    reason: "reviewed FP — native libvips binding"  # required
+    reviewer: "ops@example.com"      # optional
+    expires: "2026-09-01"            # optional YYYY-MM-DD
+```
+
+A waived package prints as `WAIVE` (not `BLOCK`) and does not fail the build. An
+**expired** waiver stops applying — the finding blocks again with a warning — so
+waivers can't silently become permanent. A waiver with no `expires` works but
+warns. A version outside the range (or a future out-of-range version) is **not**
+waived.
+
 ## Commands
 
 ### `pkgradar gate`
