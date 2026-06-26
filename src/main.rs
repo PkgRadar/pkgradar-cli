@@ -6,6 +6,7 @@ mod client;
 mod cmd;
 mod config;
 mod lockfile;
+mod waiver;
 
 #[derive(Parser, Debug)]
 #[command(

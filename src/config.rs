@@ -7,6 +7,20 @@ use anyhow::{Context, Result};
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
 
+/// One waiver: downgrade a matched blocked finding (still scanned + reported,
+/// not failing). `package` is a name glob (`*` wildcard); `versions` is an
+/// optional semver requirement (omit = all versions). Optional `expires`
+/// (YYYY-MM-DD) makes the waiver lapse so it can't become permanent.
+#[derive(Debug, Deserialize, Default, Clone)]
+#[serde(default)]
+pub struct Waiver {
+    pub package: String,
+    pub versions: Option<String>,
+    pub reason: String,
+    pub reviewer: Option<String>,
+    pub expires: Option<String>,
+}
+
 #[derive(Debug, Deserialize, Default, Clone)]
 #[serde(default)]
 pub struct RepoConfig {
@@ -38,6 +52,11 @@ pub struct RepoConfig {
     /// CLI args. Rarely useful — mostly for verifying a specific release
     /// hasn't been hijacked.
     pub watchlist: Vec<String>,
+
+    /// Downgrade reviewed false positives (see `Waiver`). Unlike `allowlist`
+    /// (bypass before scan), waived packages are still scanned + reported.
+    #[serde(default)]
+    pub waivers: Vec<Waiver>,
 }
 
 /// Resolve the config file path. If `--config <path>` was given, use that.
@@ -78,6 +97,30 @@ mod tests {
         let cfg: RepoConfig = serde_yaml::from_str("").unwrap_or_default();
         assert!(cfg.fail_on.is_none());
         assert!(cfg.allowlist.is_empty());
+    }
+
+    #[test]
+    fn waivers_parse_from_yaml() {
+        let src = r#"
+waivers:
+  - package: "sharp"
+    versions: ">=0.33.0, <0.34.0"
+    reason: "reviewed FP"
+    reviewer: "ops@x"
+    expires: "2026-09-01"
+  - package: "left-pad"
+    reason: "trivial"
+"#;
+        let cfg: RepoConfig = serde_yaml::from_str(src).unwrap();
+        assert_eq!(cfg.waivers.len(), 2);
+        assert_eq!(cfg.waivers[0].package, "sharp");
+        assert_eq!(
+            cfg.waivers[0].versions.as_deref(),
+            Some(">=0.33.0, <0.34.0")
+        );
+        assert_eq!(cfg.waivers[0].expires.as_deref(), Some("2026-09-01"));
+        assert!(cfg.waivers[1].versions.is_none());
+        assert!(cfg.waivers[1].reviewer.is_none());
     }
 
     #[test]

@@ -92,6 +92,23 @@ pub async fn run(args: GateArgs) -> Result<i32> {
     let cfg_path = config::resolve_path(args.config.as_deref());
     let cfg = config::load(cfg_path.as_deref())?;
 
+    // Validate + compile waivers up front so a bad waiver fails loudly (not
+    // silently ignored). A waiver with no expiry never lapses — warn.
+    let compiled_waivers: Vec<crate::waiver::CompiledWaiver> = cfg
+        .waivers
+        .iter()
+        .map(crate::waiver::CompiledWaiver::compile)
+        .collect::<Result<_, _>>()
+        .map_err(|e| anyhow!("invalid waiver in .pkgradar.yml: {e}"))?;
+    for w in &compiled_waivers {
+        if w.expires_day.is_none() && !args.common.quiet {
+            eprintln!(
+                "pkgradar: waiver for \"{}\" has no expiry; it will never lapse.",
+                w.package
+            );
+        }
+    }
+
     let fail_on = args
         .fail_on
         .clone()
@@ -328,6 +345,7 @@ pub async fn run(args: GateArgs) -> Result<i32> {
     let mut combined_allowed = true;
     let mut combined_blocked: Vec<BlockedItem> = Vec::new();
     let mut combined_reports: Vec<Value> = Vec::new();
+    let mut waived: Vec<WaivedItem> = Vec::new();
     let mut last_fail_on = fail_on.clone();
 
     // The gate endpoint caps each request at GATE_BATCH specs (tuned to the
@@ -441,6 +459,38 @@ pub async fn run(args: GateArgs) -> Result<i32> {
         );
     }
 
+    // Apply waivers post-response: downgrade matched blocked items (still
+    // reported, not failing). allowlist already bypassed before the scan.
+    if !compiled_waivers.is_empty() {
+        let today = crate::waiver::today_days();
+        let eco_of: std::collections::HashMap<String, String> = combined_reports
+            .iter()
+            .filter_map(|r| {
+                Some((
+                    r.get("target")?.as_str()?.to_string(),
+                    r.get("ecosystem")?.as_str()?.to_string(),
+                ))
+            })
+            .collect();
+        let (still, waived_items, expired_hits) =
+            apply_waivers(combined_blocked, &eco_of, &compiled_waivers, today);
+        for hit in &expired_hits {
+            let w = &compiled_waivers[hit.waiver_idx];
+            eprintln!(
+                "pkgradar: waiver for \"{}\" expired {}; re-blocking {}.",
+                w.package,
+                w.expires_str.as_deref().unwrap_or("?"),
+                hit.target
+            );
+        }
+        combined_blocked = still;
+        // Waivers may only relax a block (false->true), never override an
+        // unrelated verdict — guard on the prior state actually being a block.
+        if !combined_allowed && !waived_items.is_empty() && combined_blocked.is_empty() {
+            combined_allowed = true;
+        }
+        waived = waived_items;
+    }
     let merged = GateResponse {
         allowed: combined_allowed,
         fail_on: last_fail_on,
@@ -449,9 +499,13 @@ pub async fn run(args: GateArgs) -> Result<i32> {
     };
 
     match args.common.format.as_str() {
-        "json" => println!("{}", serde_json::to_string_pretty(&render_json(&merged))?),
+        "json" => println!(
+            "{}",
+            serde_json::to_string_pretty(&render_json(&merged, &waived))?
+        ),
         _ => render_text(
             &merged,
+            &waived,
             args.verbose,
             total_allowlisted,
             lockfiles_parsed,
@@ -481,12 +535,25 @@ fn classify_cli_spec(raw: &str) -> (Ecosystem, String) {
     }
 }
 
-fn render_json(response: &GateResponse) -> Value {
+fn render_json(response: &GateResponse, waived: &[WaivedItem]) -> Value {
     serde_json::json!({
         "allowed": response.allowed,
         "fail_on": response.fail_on,
         "blocked": response.blocked.iter().map(blocked_to_json).collect::<Vec<_>>(),
+        "waived": waived.iter().map(waived_to_json).collect::<Vec<_>>(),
         "decisions": response.reports.iter().map(report_to_decision).collect::<Vec<_>>(),
+    })
+}
+
+fn waived_to_json(w: &WaivedItem) -> Value {
+    serde_json::json!({
+        "target": w.item.target,
+        "ecosystem": w.eco,
+        "risk": w.item.risk,
+        "score": w.item.score,
+        "reason": w.reason,
+        "reviewer": w.reviewer,
+        "expires": w.expires,
     })
 }
 
@@ -508,11 +575,74 @@ fn report_to_decision(report: &Value) -> Value {
     })
 }
 
+/// A blocked item that a waiver downgraded — still scanned + reported, not
+/// failing. Carries the resolved ecosystem + the waiver's metadata for output.
+pub struct WaivedItem {
+    pub item: crate::client::BlockedItem,
+    pub eco: String,
+    pub reason: String,
+    pub reviewer: Option<String>,
+    pub expires: Option<String>,
+}
+
+/// An expired-waiver hit, for the stderr warning.
+pub struct ExpiredHit {
+    pub waiver_idx: usize,
+    pub target: String,
+}
+
+/// Partition blocked items into (still-blocked, waived, expired-hits) using the
+/// compiled waivers. `eco_of` maps a target to its ecosystem (from the reports).
+pub fn apply_waivers(
+    blocked: Vec<crate::client::BlockedItem>,
+    eco_of: &std::collections::HashMap<String, String>,
+    waivers: &[crate::waiver::CompiledWaiver],
+    today: i64,
+) -> (
+    Vec<crate::client::BlockedItem>,
+    Vec<WaivedItem>,
+    Vec<ExpiredHit>,
+) {
+    use crate::waiver::{decide, split_target, WaiverOutcome};
+    let mut still = Vec::new();
+    let mut waived = Vec::new();
+    let mut expired = Vec::new();
+    for item in blocked {
+        let (name, version) = split_target(&item.target);
+        match decide(name, version, waivers, today) {
+            WaiverOutcome::Applied(i) => {
+                let w = &waivers[i];
+                let eco = eco_of
+                    .get(&item.target)
+                    .cloned()
+                    .unwrap_or_else(|| "?".to_string());
+                waived.push(WaivedItem {
+                    eco,
+                    reason: w.reason.clone(),
+                    reviewer: w.reviewer.clone(),
+                    expires: w.expires_str.clone(),
+                    item,
+                });
+            }
+            WaiverOutcome::Expired(i) => {
+                expired.push(ExpiredHit {
+                    waiver_idx: i,
+                    target: item.target.clone(),
+                });
+                still.push(item);
+            }
+            WaiverOutcome::NoMatch => still.push(item),
+        }
+    }
+    (still, waived, expired)
+}
+
 /// Summary-first output: a header (counts, risk breakdown, advisories), then
 /// only the rows that carry signal (blocked / review / CVE-bearing), then a
 /// single unambiguous verdict line. `--verbose` adds a row for every package.
 fn render_text(
     response: &GateResponse,
+    waived: &[WaivedItem],
     verbose: bool,
     allowlisted: usize,
     lockfiles: usize,
@@ -578,6 +708,12 @@ fn render_text(
     }
     if allowlisted > 0 {
         println!("  allowlisted: {allowlisted} skipped");
+    }
+    if !waived.is_empty() {
+        println!(
+            "  waived: {} (reviewed — reported, not failing)",
+            waived.len()
+        );
     }
 
     // --- detail rows: blocked + review + CVE-bearing always; all if verbose ---
@@ -652,6 +788,21 @@ fn render_text(
         }
     }
 
+    // --- waived rows: still-scanned items that matched a waiver ---
+    for w in waived {
+        let mut meta = w.reason.clone();
+        if let Some(r) = &w.reviewer {
+            meta.push_str(&format!(" ({r}"));
+            if let Some(e) = &w.expires {
+                meta.push_str(&format!(", expires {e}"));
+            }
+            meta.push(')');
+        } else if let Some(e) = &w.expires {
+            meta.push_str(&format!(" (expires {e})"));
+        }
+        println!("WAIVE [{:<4}] {:<48} {meta}", w.eco, w.item.target);
+    }
+
     // --- verdict: one unambiguous line, on stdout so it always orders
     // after the summary/rows (mixing with stderr races under CI buffering).
     println!();
@@ -667,5 +818,69 @@ fn render_text(
             n = response.blocked.len(),
             fail_on = response.fail_on,
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::client::BlockedItem;
+    use crate::waiver::{days_from_civil, CompiledWaiver};
+    use std::collections::HashMap;
+
+    fn bi(target: &str) -> BlockedItem {
+        BlockedItem {
+            target: target.to_string(),
+            risk: "high".to_string(),
+            score: Some(12),
+            summary: None,
+        }
+    }
+    fn cw(pkg: &str, ver: Option<&str>, expires: Option<&str>) -> CompiledWaiver {
+        CompiledWaiver::compile(&crate::config::Waiver {
+            package: pkg.to_string(),
+            versions: ver.map(String::from),
+            reason: "reviewed".to_string(),
+            reviewer: Some("a@b".to_string()),
+            expires: expires.map(String::from),
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn waived_to_json_shape() {
+        let w = WaivedItem {
+            item: bi("sharp@0.33.5"),
+            eco: "npm".to_string(),
+            reason: "reviewed".to_string(),
+            reviewer: Some("a@b".to_string()),
+            expires: Some("2026-12-31".to_string()),
+        };
+        let v = waived_to_json(&w);
+        assert_eq!(v["target"], "sharp@0.33.5");
+        assert_eq!(v["ecosystem"], "npm");
+        assert_eq!(v["reason"], "reviewed");
+        assert_eq!(v["expires"], "2026-12-31");
+    }
+
+    #[test]
+    fn apply_waivers_partitions_and_flags() {
+        let today = days_from_civil(2026, 6, 26);
+        let blocked = vec![bi("sharp@0.33.5"), bi("evil@1.0.0"), bi("stale@2.0.0")];
+        let waivers = vec![
+            cw("sharp", Some(">=0.33.0, <0.34.0"), Some("2026-12-31")),
+            cw("stale", None, Some("2026-01-01")),
+        ];
+        let mut eco = HashMap::new();
+        eco.insert("sharp@0.33.5".to_string(), "npm".to_string());
+        let (still, waived, expired) = apply_waivers(blocked, &eco, &waivers, today);
+        let still_targets: Vec<&str> = still.iter().map(|b| b.target.as_str()).collect();
+        assert_eq!(still_targets, vec!["evil@1.0.0", "stale@2.0.0"]);
+        assert_eq!(waived.len(), 1);
+        assert_eq!(waived[0].item.target, "sharp@0.33.5");
+        assert_eq!(waived[0].eco, "npm");
+        assert_eq!(waived[0].reason, "reviewed");
+        assert_eq!(expired.len(), 1);
+        assert_eq!(expired[0].target, "stale@2.0.0");
     }
 }
