@@ -5,7 +5,6 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Days since the Unix epoch (1970-01-01 = 0) for a proleptic-Gregorian date.
 /// Howard Hinnant's `days_from_civil`.
-#[allow(dead_code)] // wired into gate.rs in a later task
 pub fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
     let y = if m <= 2 { y - 1 } else { y };
     let era = (if y >= 0 { y } else { y - 399 }) / 400;
@@ -19,7 +18,6 @@ pub fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
 
 /// Parse `YYYY-MM-DD` with range-checked month (1-12) and day (1-31). Returns
 /// None on any malformed input.
-#[allow(dead_code)] // wired into gate.rs in a later task
 pub fn parse_ymd(s: &str) -> Option<(i64, u32, u32)> {
     let parts: Vec<&str> = s.split('-').collect();
     if parts.len() != 3 {
@@ -35,7 +33,6 @@ pub fn parse_ymd(s: &str) -> Option<(i64, u32, u32)> {
 }
 
 /// Today as days-since-epoch (UTC). Clock-before-epoch degrades to day 0.
-#[allow(dead_code)] // wired into gate.rs in a later task
 pub fn today_days() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -45,7 +42,6 @@ pub fn today_days() -> i64 {
 
 /// A waiver is expired iff its expiry day is strictly before today (valid
 /// through the expiry date itself).
-#[allow(dead_code)] // wired into gate.rs in a later task
 pub fn is_expired(expires_day: i64, today: i64) -> bool {
     expires_day < today
 }
@@ -53,7 +49,6 @@ pub fn is_expired(expires_day: i64, today: i64) -> bool {
 /// Glob match with `*` wildcard (no `?`). No `*` = exact match. Segments split
 /// on `*` must appear in order; first is an anchored prefix, last an anchored
 /// suffix. Package names are ASCII so byte slicing is safe.
-#[allow(dead_code)] // wired into gate.rs in a later task
 pub fn name_glob_matches(pattern: &str, name: &str) -> bool {
     if !pattern.contains('*') {
         return pattern == name;
@@ -91,7 +86,6 @@ pub fn name_glob_matches(pattern: &str, name: &str) -> bool {
 
 /// True iff `version` parses as semver AND satisfies `req`. An unparseable
 /// version returns false — we never waive what we can't range-check.
-#[allow(dead_code)] // wired into gate.rs in a later task
 pub fn version_matches(req: &VersionReq, version: &str) -> bool {
     Version::parse(version)
         .map(|v| req.matches(&v))
@@ -100,7 +94,6 @@ pub fn version_matches(req: &VersionReq, version: &str) -> bool {
 
 /// Split a gate target into (name, version). PyPI uses `name==version`; every
 /// other ecosystem uses `name@version` (the last `@`, so npm scopes survive).
-#[allow(dead_code)] // wired into gate.rs in a later task
 pub fn split_target(target: &str) -> (&str, &str) {
     if let Some((n, v)) = target.split_once("==") {
         (n, v)
@@ -115,7 +108,6 @@ use crate::config::Waiver;
 
 /// A validated waiver: version req pre-compiled, expiry pre-parsed to a day
 /// number. Built once at gate startup; matching is then allocation-light.
-#[allow(dead_code)] // wired into gate.rs in the next task
 #[derive(Debug, Clone)]
 pub struct CompiledWaiver {
     pub package: String,
@@ -126,7 +118,6 @@ pub struct CompiledWaiver {
     pub expires_str: Option<String>,
 }
 
-#[allow(dead_code)] // wired into gate.rs in the next task
 impl CompiledWaiver {
     /// Validate + compile. Err(message) on: empty package/reason, invalid semver
     /// requirement, or unparseable `expires`.
@@ -168,7 +159,6 @@ impl CompiledWaiver {
 }
 
 /// What happened when matching one blocked item against the waiver set.
-#[allow(dead_code)] // wired into gate.rs in the next task
 #[derive(Debug, PartialEq, Eq)]
 pub enum WaiverOutcome {
     Applied(usize),
@@ -178,7 +168,6 @@ pub enum WaiverOutcome {
 
 /// Decide a single (name, version). First non-expired match wins; if the only
 /// matches are expired, report the first expired one so the caller can warn.
-#[allow(dead_code)] // wired into gate.rs in the next task
 pub fn decide(name: &str, version: &str, waivers: &[CompiledWaiver], today: i64) -> WaiverOutcome {
     let mut first_expired: Option<usize> = None;
     for (i, w) in waivers.iter().enumerate() {
