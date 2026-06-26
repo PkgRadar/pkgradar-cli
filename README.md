@@ -128,6 +128,25 @@ pkgradar gate lodash@4.17.21 left-pad@1.3.0 --fail-on high
 pkgradar gate --lockfile pnpm-lock.yaml --fail-on review
 ```
 
+#### Merge-request (diff) mode
+
+By default `pkgradar gate` evaluates the **whole** lockfile, so a pre-existing
+high-risk dependency fails every pipeline. On merge requests, pass `--baseline
+<git-ref>` to gate only the dependencies the change **adds or version-bumps**:
+
+```sh
+pkgradar gate --baseline "$CI_MERGE_REQUEST_DIFF_BASE_SHA"    # GitLab
+pkgradar gate --baseline "$(git merge-base origin/main HEAD)" # generic
+```
+
+It diffs the current lockfile(s) against the ref (`git show <ref>:<lockfile>`)
+and gates only the new `name@version` specs. A pre-existing flagged dep no longer
+blocks an unrelated MR; the same dep newly added still does. Requires git on PATH
+and the ref fetched (CI shallow-clones — use `fetch-depth: 0` or a `git fetch` of
+the target). If the ref can't be resolved, the gate falls back to the full
+lockfile with a warning (never less safe). The GitHub Action and GitLab template
+wire this automatically on PR/MR pipelines — no flag needed.
+
 ### `pkgradar scan`
 
 Returns the full scan report rather than the gate decision. Use this when

@@ -45,6 +45,14 @@ inputs:
   base-url:
     description: Override the PkgRadar API base URL (only for self-hosted setups).
     required: false
+  baseline:
+    description: >-
+      Git ref to diff against — gate only dependencies ADDED or version-bumped
+      vs this ref, instead of the whole lockfile. Leave UNSET to auto-use the PR
+      merge-base on pull_request events (absolute gating otherwise). For accurate
+      diffs, the caller's checkout should use fetch-depth: 0.
+    required: false
+    default: ""
 
 runs:
   using: composite
@@ -127,6 +135,9 @@ runs:
         INPUT_CONFIG: ${{ inputs.config }}
         INPUT_BASE_URL: ${{ inputs.base-url }}
         INPUT_FAIL_OPEN: ${{ inputs.fail-open }}
+        INPUT_BASELINE: ${{ inputs.baseline }}
+        GH_EVENT_NAME: ${{ github.event_name }}
+        GH_BASE_REF: ${{ github.base_ref }}
       run: |
         set -euo pipefail
         ARGS=(--fail-on "$INPUT_FAIL_ON")
@@ -147,5 +158,16 @@ runs:
         fi
         if [ "$INPUT_FAIL_OPEN" != "true" ]; then
           ARGS+=(--no-fail-open)
+        fi
+        # Diff/MR mode. Explicit input wins; else auto-use the PR merge-base on
+        # pull_request events. Best-effort fetch; the CLI falls back to absolute
+        # gating (with a warning) if the ref can't be resolved.
+        BASELINE="$INPUT_BASELINE"
+        if [ -z "$BASELINE" ] && [ "$GH_EVENT_NAME" = "pull_request" ] && [ -n "$GH_BASE_REF" ]; then
+          git fetch --no-tags --quiet origin "$GH_BASE_REF" 2>/dev/null || true
+          BASELINE="$(git merge-base "origin/$GH_BASE_REF" HEAD 2>/dev/null || true)"
+        fi
+        if [ -n "$BASELINE" ]; then
+          ARGS+=(--baseline "$BASELINE")
         fi
         pkgradar gate "${ARGS[@]}"
