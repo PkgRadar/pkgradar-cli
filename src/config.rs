@@ -56,6 +56,7 @@ pub struct RepoConfig {
     /// Downgrade reviewed false positives (see `Waiver`). Unlike `allowlist`
     /// (bypass before scan), waived packages are still scanned + reported.
     #[serde(default)]
+    #[allow(dead_code)] // wired into gate.rs in a later task
     pub waivers: Vec<Waiver>,
 }
 
