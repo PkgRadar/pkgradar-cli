@@ -26,7 +26,21 @@ pub fn parse_ymd(s: &str) -> Option<(i64, u32, u32)> {
     let y: i64 = parts[0].parse().ok()?;
     let m: u32 = parts[1].parse().ok()?;
     let d: u32 = parts[2].parse().ok()?;
-    if !(1..=12).contains(&m) || !(1..=31).contains(&d) {
+    if !(1..=12).contains(&m) {
+        return None;
+    }
+    // Reject phantom calendar dates (e.g. 2026-02-31). days_from_civil's modular
+    // arithmetic would silently map them to a later real date, making a waiver
+    // outlive its intended expiry.
+    let leap = (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
+    let max_day = match m {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if leap => 29,
+        2 => 28,
+        _ => return None,
+    };
+    if !(1..=max_day).contains(&d) {
         return None;
     }
     Some((y, m, d))
@@ -270,6 +284,16 @@ mod tests {
             decide("unrelated", "1.0.0", &ws, today),
             WaiverOutcome::NoMatch
         ));
+        // Expired waiver listed BEFORE a valid one for the same package: the
+        // valid match must win (Applied), not the earlier expired one.
+        let ordered = vec![
+            cw("dup", None, Some("2026-01-01")), // expired, index 0
+            cw("dup", None, Some("2026-12-31")), // valid, index 1
+        ];
+        assert!(matches!(
+            decide("dup", "1.0.0", &ordered, today),
+            WaiverOutcome::Applied(1)
+        ));
     }
 
     #[test]
@@ -331,6 +355,11 @@ mod tests {
         assert!(parse_ymd("2026-09-32").is_none());
         assert!(parse_ymd("nope").is_none());
         assert!(parse_ymd("2026/09/01").is_none());
+        // Phantom calendar dates must be rejected (not silently mapped forward).
+        assert!(parse_ymd("2026-02-31").is_none());
+        assert!(parse_ymd("2026-04-31").is_none());
+        assert!(parse_ymd("2026-02-29").is_none()); // 2026 not a leap year
+        assert_eq!(parse_ymd("2024-02-29"), Some((2024, 2, 29))); // leap year OK
     }
 
     #[test]

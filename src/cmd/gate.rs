@@ -484,8 +484,9 @@ pub async fn run(args: GateArgs) -> Result<i32> {
             );
         }
         combined_blocked = still;
-        // Waiving can only relax false->true (clear a block), never the reverse.
-        if !waived_items.is_empty() && combined_blocked.is_empty() {
+        // Waivers may only relax a block (false->true), never override an
+        // unrelated verdict — guard on the prior state actually being a block.
+        if !combined_allowed && !waived_items.is_empty() && combined_blocked.is_empty() {
             combined_allowed = true;
         }
         waived = waived_items;
