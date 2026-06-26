@@ -1,6 +1,54 @@
 //! Waiver matching: name glob, semver range, expiry — pure, fully unit-tested.
 
 use semver::{Version, VersionReq};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+/// Days since the Unix epoch (1970-01-01 = 0) for a proleptic-Gregorian date.
+/// Howard Hinnant's `days_from_civil`.
+#[allow(dead_code)] // wired into gate.rs in a later task
+pub fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = (if y >= 0 { y } else { y - 399 }) / 400;
+    let yoe = y - era * 400; // [0, 399]
+    let m = m as i64;
+    let d = d as i64;
+    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1; // [0, 365]
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy; // [0, 146096]
+    era * 146097 + doe - 719468
+}
+
+/// Parse `YYYY-MM-DD` with range-checked month (1-12) and day (1-31). Returns
+/// None on any malformed input.
+#[allow(dead_code)] // wired into gate.rs in a later task
+pub fn parse_ymd(s: &str) -> Option<(i64, u32, u32)> {
+    let parts: Vec<&str> = s.split('-').collect();
+    if parts.len() != 3 {
+        return None;
+    }
+    let y: i64 = parts[0].parse().ok()?;
+    let m: u32 = parts[1].parse().ok()?;
+    let d: u32 = parts[2].parse().ok()?;
+    if !(1..=12).contains(&m) || !(1..=31).contains(&d) {
+        return None;
+    }
+    Some((y, m, d))
+}
+
+/// Today as days-since-epoch (UTC). Clock-before-epoch degrades to day 0.
+#[allow(dead_code)] // wired into gate.rs in a later task
+pub fn today_days() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| (d.as_secs() / 86_400) as i64)
+        .unwrap_or(0)
+}
+
+/// A waiver is expired iff its expiry day is strictly before today (valid
+/// through the expiry date itself).
+#[allow(dead_code)] // wired into gate.rs in a later task
+pub fn is_expired(expires_day: i64, today: i64) -> bool {
+    expires_day < today
+}
 
 /// Glob match with `*` wildcard (no `?`). No `*` = exact match. Segments split
 /// on `*` must appear in order; first is an anchored prefix, last an anchored
@@ -106,5 +154,33 @@ mod tests {
             ("group:artifact", "1.0")
         );
         assert_eq!(split_target("noversion"), ("noversion", ""));
+    }
+
+    #[test]
+    fn civil_days_known_points() {
+        assert_eq!(days_from_civil(1970, 1, 1), 0);
+        assert_eq!(days_from_civil(1970, 1, 2), 1);
+        assert_eq!(days_from_civil(2000, 1, 1), 10957);
+        assert_eq!(
+            days_from_civil(2024, 3, 1) - days_from_civil(2024, 2, 29),
+            1
+        );
+    }
+
+    #[test]
+    fn parse_ymd_ok_and_junk() {
+        assert_eq!(parse_ymd("2026-09-01"), Some((2026, 9, 1)));
+        assert!(parse_ymd("2026-13-01").is_none());
+        assert!(parse_ymd("2026-09-32").is_none());
+        assert!(parse_ymd("nope").is_none());
+        assert!(parse_ymd("2026/09/01").is_none());
+    }
+
+    #[test]
+    fn expired_boundary() {
+        let today = days_from_civil(2026, 6, 26);
+        assert!(is_expired(days_from_civil(2026, 6, 25), today));
+        assert!(!is_expired(days_from_civil(2026, 6, 26), today));
+        assert!(!is_expired(days_from_civil(2026, 6, 27), today));
     }
 }
