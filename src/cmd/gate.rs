@@ -72,6 +72,12 @@ pub struct GateArgs {
     #[arg(long)]
     pub allow_no_lockfile: bool,
 
+    /// Gate only entries ADDED or version-bumped versus this git ref (e.g. the
+    /// merge-request target). Requires git on PATH and the ref fetched. When the
+    /// ref can't be resolved, falls back to gating the full lockfile with a warning.
+    #[arg(long)]
+    pub baseline: Option<String>,
+
     #[command(flatten)]
     pub common: CommonArgs,
 }
@@ -206,6 +212,23 @@ pub async fn run(args: GateArgs) -> Result<i32> {
         ));
     }
 
+    // Diff mode: only gate entries new vs a baseline git ref (MR pipelines).
+    // Resolve the ref ONCE; an unresolvable ref degrades to absolute mode so we
+    // never silently skip scanning.
+    let diff_ref: Option<String> = match args.baseline.as_deref() {
+        Some(r) if crate::baseline::ref_is_resolvable_in(std::path::Path::new("."), r) => {
+            Some(r.to_string())
+        }
+        Some(r) => {
+            eprintln!(
+                "pkgradar: --baseline {r} could not be resolved (git missing or ref not \
+                 fetched); gating the full lockfile instead."
+            );
+            None
+        }
+        None => None,
+    };
+
     // Parse each lockfile and print its resolved path + spec count, so
     // coverage is explicit rather than deduced from a final tally.
     let mut lockfiles_parsed = 0usize;
@@ -214,14 +237,40 @@ pub async fn run(args: GateArgs) -> Result<i32> {
             Ok(entries) => {
                 lockfiles_parsed += 1;
                 let n = entries.len();
+                // In diff mode, keep only entries new vs the baseline for THIS lockfile.
+                let gated: Vec<lockfile::LockfileEntry> = if let Some(r) = diff_ref.as_deref() {
+                    match crate::baseline::baseline_entries(r, path) {
+                        crate::baseline::BaselineOutcome::Entries(base) => {
+                            crate::baseline::new_entries(&entries, &base)
+                        }
+                        crate::baseline::BaselineOutcome::Unreadable => {
+                            eprintln!(
+                                "pkgradar: couldn't read {} at {r}; gating all of it.",
+                                path.display()
+                            );
+                            entries.clone()
+                        }
+                    }
+                } else {
+                    entries.clone()
+                };
                 if !args.common.quiet {
                     // stdout (not stderr) so the whole human narrative —
                     // lockfile lines, summary, verdict — is one ordered
                     // stream. Mixing stdout+stderr races under CI buffering
                     // (verdict could print before the summary).
-                    println!("pkgradar: {} — {} package(s)", path.display(), n);
+                    if diff_ref.is_some() {
+                        println!(
+                            "pkgradar: {} — {} package(s) ({} new vs baseline)",
+                            path.display(),
+                            n,
+                            gated.len()
+                        );
+                    } else {
+                        println!("pkgradar: {} — {} package(s)", path.display(), n);
+                    }
                 }
-                for entry in entries {
+                for entry in gated {
                     record(eco_from_lockfile(entry.ecosystem), entry.spec());
                 }
             }
@@ -235,6 +284,13 @@ pub async fn run(args: GateArgs) -> Result<i32> {
                 // shouldn't fail the whole run — warn and move on.
                 eprintln!("pkgradar: skipping {} ({err:#})", path.display());
             }
+        }
+    }
+
+    if let Some(r) = diff_ref.as_deref() {
+        if !args.common.quiet {
+            let new_total: usize = buckets.values().map(|b| b.specs.len()).sum();
+            println!("pkgradar: diff mode — gating only changes vs {r} ({new_total} new spec(s)).");
         }
     }
 

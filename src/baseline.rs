@@ -5,7 +5,6 @@
 //!
 //! Everything here is wired into `gate.rs` by the diff-wiring task; until then
 //! the non-test items have no non-test caller.
-#![allow(dead_code)] // used by gate.rs in the diff-wiring task
 
 use std::collections::HashSet;
 use std::path::Path;
