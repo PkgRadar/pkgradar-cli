@@ -72,6 +72,13 @@ jobs:
           # so an explicit build-tool override isn't required here.
           - target: aarch64-unknown-linux-gnu
             os: ubuntu-latest
+          # Static musl builds — no glibc dependency, so they run on ANY Linux
+          # (Alpine + old Debian/Ubuntu + node:*). install.sh and the CI
+          # templates prefer these; the -gnu builds above stay as a fallback.
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-latest
           # macos-latest is Apple Silicon — rustc cross-compiles to
           # x86_64-apple-darwin natively from the M-series host, no
           # Rosetta involved. Avoiding the chronically backlogged free
@@ -87,6 +94,12 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
+
+      - name: Install musl toolchain
+        if: contains(matrix.target, '-linux-musl')
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends musl-tools
 
       - name: Cache cargo
         uses: actions/cache@v4
